@@ -3,21 +3,44 @@ from typing import List, Tuple, Optional, Dict, Any
 
 import numpy as np
 
+from memory import crypto
+from memory.database import PersonaMemory
 from tools.rerank_client import maybe_rerank
 
 
 class HybridRetriever:
     """
-    工业级双路召回 + RRF 融合检索引擎。
+    工业级三路召回 + RRF 融合检索引擎。
 
     - 路 1：SQLite FTS5 关键词检索（BM25 排序）
     - 路 2：向量语义检索（余弦相似度）
+    - 路 3：实体聚合召回（query 命中已登记实体 -> 关联记忆 id）
     - 融合：Reciprocal Rank Fusion (RRF)
     """
 
     def __init__(self, db_path: str = "./data/axiodrasil_core.db", k: int = 60):
         self.db_path = db_path
         self.k = k  # RRF 常数，防止长尾放大
+        self._persona_memory = PersonaMemory(db_path=db_path)  # 复用实体表 + 解密逻辑
+
+    # --------- 路 3：实体聚合召回 ---------
+    def _get_entity_scores(
+        self,
+        query: str,
+        top_n: int = 10,
+        thread_id: Optional[str] = None,
+    ) -> List[int]:
+        """
+        极简实体聚合：不引入图数据库/NER 模型，实体登记来自
+        `memory/enrichment.py` 的轻量抽取（写入 entities/entity_memory_links）。
+        这里只做「query 命中哪些已登记实体名 -> 拉出关联记忆 id」，按登记顺序
+        返回（没有独立的相关性分数，交给 RRF 按排名融合）。
+        """
+        try:
+            return self._persona_memory.find_entity_memory_ids(thread_id, query, top_n=top_n)
+        except Exception as e:
+            print(f"⚠️ [HybridRetriever] 实体召回失败，跳过第三路: {e}")
+            return []
 
     # --------- 路 1：FTS5 关键词检索 ---------
     def _get_keyword_scores(
@@ -140,11 +163,14 @@ class HybridRetriever:
         self,
         keyword_results: List[int],
         vector_results: List[int],
+        entity_results: Optional[List[int]] = None,
     ) -> List[Tuple[int, float]]:
         """
         倒数排名融合 (Reciprocal Rank Fusion, RRF)
 
-        score(d) = sum_{list∈{K,V}} 1 / (k + rank_{list}(d))
+        score(d) = sum_{list∈{K,V,E}} 1 / (k + rank_{list}(d))
+
+        `entity_results` 可选，向后兼容旧的两路调用方式。
         """
         scores: Dict[int, float] = {}
 
@@ -152,6 +178,9 @@ class HybridRetriever:
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (self.k + rank + 1)
 
         for rank, doc_id in enumerate(vector_results):
+            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (self.k + rank + 1)
+
+        for rank, doc_id in enumerate(entity_results or []):
             scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (self.k + rank + 1)
 
         # 按 RRF 分数从高到低排序
@@ -175,7 +204,7 @@ class HybridRetriever:
           若配置了 Rerank API 则再截断为 top_k，否则按 RRF 顺序取 top_k
         - 输出：前 top_k 条 memory_matrix 记录
         """
-        # 两路召回
+        # 三路召回
         keyword_ids = self._get_keyword_scores(
             query=query,
             top_n=top_k * 4,  # 多召回一些，便于融合重排
@@ -190,8 +219,14 @@ class HybridRetriever:
             quadrant=quadrant,
         )
 
+        entity_ids = self._get_entity_scores(
+            query=query,
+            top_n=top_k * 4,
+            thread_id=thread_id,
+        )
+
         # RRF 融合
-        fused = self.rrf_fusion(keyword_ids, vector_ids)
+        fused = self.rrf_fusion(keyword_ids, vector_ids, entity_ids)
         if not fused:
             return []
 
@@ -211,13 +246,14 @@ class HybridRetriever:
             cursor = conn.execute(sql, top_ids)
             rows = cursor.fetchall()
 
-        # 将结果转为字典列表，方便上层直接使用
+        # 将结果转为字典列表，方便上层直接使用；content 统一在这里解密一次
+        # （若未开启加密，crypto.decrypt 是恒等函数，行为与之前一致）
         result = [
             {
                 "id": row[0],
                 "thread_id": row[1],
                 "quadrant": row[2],
-                "content": row[3],
+                "content": crypto.decrypt(row[3]),
                 "status": row[4],
                 "created_at": row[5],
             }

@@ -2,19 +2,62 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+# 内阁完整人格阵容（BIOS V17.0 Module 1）+ Jean（文档/RAG 功能性角色，不在 BIOS
+# 人设阵容内，但承担现有 Hybrid RAG 检索职能，故一并保留在 persona 枚举里）。
+PersonaName = Literal[
+    # Tier 1: The Core（常驻神经元）
+    "bina",
+    "bit",
+    "taki",
+    "chizheng",
+    # Tier 2: Specialists（按需触发）
+    "tianji",
+    "fukucho",
+    "vinci",
+    # Tier 3: The Think Tank（深层）
+    "planck",
+    "jiafa",
+    "qianjin",
+    "boming",
+    # 功能性角色（非 BIOS 人设阵容，承担文档/RAG 检索）
+    "jean",
+]
+
+# domain -> 默认执勤人格。domain 是粗分类（兼容现有 4 类路由），persona 是
+# 11+1 人格里具体哪一个；route_by_intent 先按 domain 粗分发，再由关键词触发/
+# 召唤协议/双重权重机制在节点内部精细化到具体 persona。
+DOMAIN_DEFAULT_PERSONA: dict[str, PersonaName] = {
+    "emotion": "bina",
+    "jean": "jean",
+    "bit": "bit",
+    "juzheng": "chizheng",
+    "unknown": "chizheng",
+}
+
 
 class TaskIntent(BaseModel):
-    """核心输入解析协议 (V15.0)"""
+    """核心输入解析协议 (V15.0 + persona 分层)"""
 
     task_type: Literal["emotion", "jean", "bit", "juzheng", "unknown"] = Field(
         ...,
-        description="""任务分类路由标识。只能是以下五个值之一：
+        description="""任务分类路由标识（domain，大类）。只能是以下五个值之一：
         - emotion: 情绪疏导、安抚、吐槽、求支持；同时承接医疗红线熔断场景。
         - jean: 文档/资料管理（提炼要点、阅读路线、资料摘要、基于检索材料的组织表达）。
         - bit: 代码/专业知识管理（推导、审计、给可运行代码；必要时调用工具）。
         - juzheng: 战略管理（计划、步骤拆解、复盘框架、长期安排）。
         - unknown: 无法稳定判断时使用。
-        绝对禁止输出 emotion、jean、bit、juzheng、unknown 之外的任何新标签。""",
+        绝对禁止输出 emotion、jean、bit、juzheng、unknown 之外的任何新标签。
+        注意：juzheng 这个 domain 名称是历史遗留（对应 BIOS 人设 Chizheng），
+        为了不牵动既有 API/前端字段而保留，具体人格名以 persona 字段为准。""",
+    )
+    persona: PersonaName = Field(
+        default="chizheng",
+        description=(
+            "具体执勤人格（11 人 BIOS 阵容 + Jean）。此字段不要求大模型自行判断——"
+            "parser 拿到 task_type 后会用 DOMAIN_DEFAULT_PERSONA 覆盖为确定性默认值，"
+            "再由 route_by_intent 的关键词触发/召唤协议按需精细化，避免让大模型对"
+            "11 个人格做不稳定的分类。"
+        ),
     )
     urgency_level: int = Field(
         default=1, ge=1, le=5, description="紧急程度，范围只能是 1 到 5。"

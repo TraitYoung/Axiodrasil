@@ -1,5 +1,8 @@
 import sqlite3
 from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from memory import crypto
 
 
 class PersonaMemory:
@@ -7,10 +10,31 @@ class PersonaMemory:
         # 确保数据库所在目录存在（首次运行不报错）
         self.db_path = db_path
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+        # 【敏感字段加密，可选开启，见 memory/crypto.py】
+        # 未设置 AX_MEMORY_ENC_KEY 时保持明文存储（不影响现有 FTS5 关键词检索）；
+        # 设置后 memory_matrix.content / memory_fragments.content 会以密文落库。
+        # 已知取舍：memory_matrix 走 FTS5 external-content 触发器同步索引，
+        # 触发器只能原样复制列值，没有能力在 SQL 层做解密再分词——因此一旦
+        # 开启加密，新写入的 memory_matrix 记录会导致 FTS5 关键词召回失效
+        # （索引到的是密文，无法匹配明文查询），Hybrid 检索会自然退化为
+        # 向量 + 实体两路。如果要两者兼得，需要单独维护一份"仅供分词、不含
+        # 原文"的摘要列，这个不在本次改造范围内，先诚实记录这个限制。
         self._init_db()
 
+    # ---------- 加解密（委托给 memory/crypto.py，避免多处重复实现） ----------
+    def _encrypt(self, plaintext: str) -> str:
+        return crypto.encrypt(plaintext)
+
+    def _decrypt(self, stored: str) -> str:
+        return crypto.decrypt(stored)
+
+    @property
+    def encryption_enabled(self) -> bool:
+        return crypto.is_enabled()
+
     def _init_db(self) -> None:
-        """初始化豪威尔记忆矩阵表 + FTS5 视图 + 向量表"""
+        """初始化记忆矩阵表 + FTS5 视图 + 向量表 + 滚动摘要/细粒度记忆/实体表"""
         with sqlite3.connect(self.db_path) as conn:
             # 1) 原始记忆矩阵
             conn.execute(
@@ -34,7 +58,7 @@ class PersonaMemory:
                 """
             )
 
-            # 2) 向量表：存放 text-embedding-3-small 1536 维向量
+            # 2) 向量表：存放 embedding 客户端产出的向量（当前 1536 维 float32）
             # 冷启动与增量更新交由 migration/上层逻辑负责
             conn.execute(
                 """
@@ -89,18 +113,112 @@ class PersonaMemory:
                 """
             )
 
+            # 5) 滚动摘要层：填补 Redis 5 轮窗口与 L3 长期记忆之间的中期记忆空白
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT,
+                    range_start_ts TEXT,
+                    range_end_ts TEXT,
+                    turn_count INTEGER,
+                    summary TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_summaries_thread
+                ON memory_summaries (thread_id, created_at)
+                """
+            )
+
+            # 6) 每个 thread 的滚动计数器：累计多少轮未生成摘要
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_turn_counters (
+                    thread_id TEXT PRIMARY KEY,
+                    turns_since_summary INTEGER NOT NULL DEFAULT 0,
+                    total_turns INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+
+            # 7) 细粒度记忆碎片：事实 / 偏好 / 情绪快照，由后台异步任务从
+            # Q1/Q2 原始内容中提取，取代"整段 raw_input 直接向量化"的粗粒度方案
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_fragments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT,
+                    source_memory_id INTEGER,
+                    fragment_type TEXT, -- 'fact' | 'preference' | 'emotion'
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (source_memory_id) REFERENCES memory_matrix(id) ON DELETE CASCADE
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_fragments_thread_type
+                ON memory_fragments (thread_id, fragment_type)
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_fragment_embeddings (
+                    fragment_id INTEGER PRIMARY KEY,
+                    embedding BLOB NOT NULL,
+                    FOREIGN KEY (fragment_id) REFERENCES memory_fragments(id) ON DELETE CASCADE
+                )
+                """
+            )
+
+            # 8) 实体聚合表：Hybrid RAG 第三路召回（人物/项目/关键词 -> 关联记忆 id）
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT,
+                    name TEXT,
+                    entity_type TEXT, -- 'person' | 'project' | 'keyword' | ...
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(thread_id, name, entity_type)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS entity_memory_links (
+                    entity_id INTEGER,
+                    memory_id INTEGER,
+                    source TEXT, -- 'matrix' | 'fragment'
+                    PRIMARY KEY (entity_id, memory_id, source),
+                    FOREIGN KEY (entity_id) REFERENCES entities(id) ON DELETE CASCADE
+                )
+                """
+            )
+
             conn.commit()
 
-    def save_memory(self, thread_id: str, content: str, quadrant: str) -> None:
-        """存入记忆（文本部分）。向量部分由上层在生成 embedding 后写入 memory_embeddings。"""
+    # ==================== L3 原始记忆矩阵 ====================
+    def save_memory(self, thread_id: str, content: str, quadrant: str) -> int:
+        """存入记忆（文本部分）。向量部分由上层在生成 embedding 后写入 memory_embeddings。
+
+        返回新写入行的 id，便于上层（异步提取任务）关联 source_memory_id。
+        """
+        stored_content = self._encrypt(content)
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO memory_matrix (thread_id, content, quadrant) VALUES (?, ?, ?)",
-                (thread_id, content, quadrant),
+                (thread_id, stored_content, quadrant),
             )
             conn.commit()
+            return int(cur.lastrowid)
 
-    def get_active_q1(self, thread_id: str):
+    def get_active_q1(self, thread_id: str) -> List[str]:
         """获取指定对话下所有未完成的 Q1 (重要且紧急) 指令，用于注入上下文"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.execute(
@@ -111,4 +229,196 @@ class PersonaMemory:
                 """,
                 (thread_id,),
             )
-            return [row[0] for row in cursor.fetchall()]
+            rows = cursor.fetchall()
+        return [self._decrypt(row[0]) for row in rows]
+
+    # ==================== 滚动摘要层 ====================
+    def bump_turn_counter(self, thread_id: str) -> int:
+        """每完成一轮对话调用一次，返回自上次摘要以来累计的轮数。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_turn_counters (thread_id, turns_since_summary, total_turns)
+                VALUES (?, 1, 1)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    turns_since_summary = turns_since_summary + 1,
+                    total_turns = total_turns + 1
+                """,
+                (thread_id,),
+            )
+            conn.commit()
+            cur = conn.execute(
+                "SELECT turns_since_summary FROM memory_turn_counters WHERE thread_id = ?",
+                (thread_id,),
+            )
+            row = cur.fetchone()
+        return int(row[0]) if row else 0
+
+    def reset_turn_counter(self, thread_id: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE memory_turn_counters SET turns_since_summary = 0 WHERE thread_id = ?",
+                (thread_id,),
+            )
+            conn.commit()
+
+    def save_summary(
+        self,
+        thread_id: str,
+        summary: str,
+        range_start_ts: str,
+        range_end_ts: str,
+        turn_count: int,
+    ) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO memory_summaries
+                    (thread_id, range_start_ts, range_end_ts, turn_count, summary)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (thread_id, range_start_ts, range_end_ts, turn_count, summary),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def get_recent_summaries(self, thread_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT summary, range_start_ts, range_end_ts, turn_count, created_at
+                FROM memory_summaries
+                WHERE thread_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (thread_id, limit),
+            )
+            rows = cur.fetchall()
+        return [
+            {
+                "summary": row[0],
+                "range_start_ts": row[1],
+                "range_end_ts": row[2],
+                "turn_count": row[3],
+                "created_at": row[4],
+            }
+            for row in rows
+        ]
+
+    # ==================== 细粒度记忆碎片 ====================
+    def save_fragment(
+        self,
+        thread_id: str,
+        content: str,
+        fragment_type: str,
+        source_memory_id: Optional[int] = None,
+    ) -> int:
+        stored_content = self._encrypt(content)
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO memory_fragments (thread_id, source_memory_id, fragment_type, content)
+                VALUES (?, ?, ?, ?)
+                """,
+                (thread_id, source_memory_id, fragment_type, stored_content),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def save_fragment_embedding(self, fragment_id: int, embedding_blob: bytes) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_fragment_embeddings (fragment_id, embedding)
+                VALUES (?, ?)
+                ON CONFLICT(fragment_id) DO UPDATE SET embedding = excluded.embedding
+                """,
+                (fragment_id, embedding_blob),
+            )
+            conn.commit()
+
+    def get_fragments(self, thread_id: str, fragment_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        sql = "SELECT id, fragment_type, content, created_at FROM memory_fragments WHERE thread_id = ?"
+        params: List[Any] = [thread_id]
+        if fragment_type:
+            sql += " AND fragment_type = ?"
+            params.append(fragment_type)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(sql, params)
+            rows = cur.fetchall()
+        return [
+            {
+                "id": row[0],
+                "fragment_type": row[1],
+                "content": self._decrypt(row[2]),
+                "created_at": row[3],
+            }
+            for row in rows
+        ]
+
+    # ==================== 实体聚合 ====================
+    def upsert_entity(self, thread_id: str, name: str, entity_type: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO entities (thread_id, name, entity_type)
+                VALUES (?, ?, ?)
+                ON CONFLICT(thread_id, name, entity_type) DO NOTHING
+                """,
+                (thread_id, name, entity_type),
+            )
+            conn.commit()
+            cur = conn.execute(
+                "SELECT id FROM entities WHERE thread_id = ? AND name = ? AND entity_type = ?",
+                (thread_id, name, entity_type),
+            )
+            row = cur.fetchone()
+        return int(row[0])
+
+    def link_entity(self, entity_id: int, memory_id: int, source: str = "matrix") -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO entity_memory_links (entity_id, memory_id, source)
+                VALUES (?, ?, ?)
+                ON CONFLICT(entity_id, memory_id, source) DO NOTHING
+                """,
+                (entity_id, memory_id, source),
+            )
+            conn.commit()
+
+    def find_entity_memory_ids(self, thread_id: Optional[str], query: str, top_n: int = 10) -> List[int]:
+        """极简实体召回：query 里出现了哪些已登记的实体名，就把对应记忆 id 都拿出来。
+
+        不引入图数据库/NER 模型，实体来源由 `memory/enrichment.py` 的轻量抽取
+        写入 `entities` 表；这里只做字符串包含匹配 + 关联记忆去重。
+        """
+        sql = "SELECT id, name FROM entities"
+        params: List[Any] = []
+        if thread_id is not None:
+            sql += " WHERE thread_id = ?"
+            params.append(thread_id)
+        with sqlite3.connect(self.db_path) as conn:
+            entity_rows = conn.execute(sql, params).fetchall()
+
+            matched_ids = [eid for eid, name in entity_rows if name and name in query]
+            if not matched_ids:
+                return []
+
+            placeholders = ",".join("?" for _ in matched_ids)
+            link_rows = conn.execute(
+                f"""
+                SELECT memory_id FROM entity_memory_links
+                WHERE entity_id IN ({placeholders}) AND source = 'matrix'
+                LIMIT ?
+                """,
+                (*matched_ids, top_n),
+            ).fetchall()
+        return [row[0] for row in link_rows]
+
+    def decrypt_content(self, stored: str) -> str:
+        """暴露给 hybrid_engine 等外部模块的解密入口，避免各处重复实现。"""
+        return self._decrypt(stored)

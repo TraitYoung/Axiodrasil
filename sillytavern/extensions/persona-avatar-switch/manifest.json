@@ -1,0 +1,12 @@
+{
+  "display_name": "Axiodrasil Persona Avatar Switch",
+  "loading_order": 100,
+  "requires": [],
+  "optional": ["expressions"],
+  "js": "index.js",
+  "css": "",
+  "author": "Axiodrasil",
+  "version": "1.0.0",
+  "homePage": "",
+  "auto_update": false
+}
