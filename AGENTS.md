@@ -108,10 +108,11 @@ User Input → FastAPI (main.py) → SessionCache (Redis, 5-turn sliding window)
 9. Diversity patch (Q3/Q4 only, 15% probability) → random low-frequency persona
 
 **Memory architecture is 4-tier**:
-- **L1**: Redis session cache — 5-turn sliding window, 1h TTL (`memory/session_cache.py`)
-- **L2**: Rolling summaries — mid-term, generated every 20 turns by async task (`memory/enrichment.py`)
-- **L3**: Memory matrix — SQLite with FTS5 + 1536-dim vector BLOBs + entity tables (`memory/database.py`)
-- **Enrichment pipeline**: Q1/Q2 memories trigger async `extract_and_store` → fragments (fact/preference/emotion) + entity registration
+- **L1**: Redis session cache — 5-turn sliding window, 1h TTL (`memory/session_cache.py`); SQLite `chat_turns` cold history for history/export and Redis fallback (`main.py` `_persist_turn`)
+- **L2**: Rolling summaries — mid-term, generated every 20 turns by async task; **injected** into parser + persona prompts via `memory/context_inject.py`
+- **L3**: Memory matrix — SQLite with FTS5 + 1536-dim vector BLOBs + entity tables (`memory/database.py`); online `embed_and_store_memory` after Q1/Q2 save
+- **Enrichment pipeline**: Q1/Q2 memories trigger async `extract_and_store` → fragments (fact/preference/emotion) + entity registration; preference/fact fragments injected on emotion/闲聊 paths (Bina/Tianji/Fukucho/Qianjin)
+- **Interaction hooks**: MoodEngine `arm_interaction_hook` before `tick` — reunion (>2h) / daily-first greetings (`AX_INTERACTION_HOOKS_ENABLED`)
 
 **Hybrid RAG** (`hybrid_engine.py`): 3-way recall (FTS5 BM25 + cosine vector + entity string match) → RRF fusion → optional external rerank (Jina/SiliconFlow). Used primarily by Jean node for Q2 document retrieval.
 

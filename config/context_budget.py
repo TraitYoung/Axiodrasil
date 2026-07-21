@@ -33,6 +33,18 @@ WORKFLOW_USER_TEXT_MAX_CHARS = _env_int("AX_WORKFLOW_USER_MAX_CHARS", 8000)
 # 工作流：步骤间传递的 JSON 摘要硬上限（避免下一步 prompt 膨胀）
 WORKFLOW_STEP_JSON_MAX_CHARS = _env_int("AX_WORKFLOW_STEP_JSON_MAX_CHARS", 2500)
 
+# L2 滚动摘要注入 parser / 人格 prompt 的总字符上限
+MAX_SUMMARY_INJECT_CHARS = _env_int("AX_SUMMARY_INJECT_MAX_CHARS", 1200)
+
+# 偏好/事实碎片注入人格 prompt 的总字符上限
+MAX_FRAGMENT_INJECT_CHARS = _env_int("AX_FRAGMENT_INJECT_MAX_CHARS", 800)
+
+# 人格节点侧短历史（比 parser 略短，避免回复 prompt 过胀）
+MAX_AGENT_HISTORY_CHARS = _env_int("AX_AGENT_HISTORY_MAX_CHARS", 2000)
+
+# 人格节点注入的最近历史轮数上限
+MAX_AGENT_HISTORY_TURNS = _env_int("AX_AGENT_HISTORY_TURNS", 5)
+
 
 def clip_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:

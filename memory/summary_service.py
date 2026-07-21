@@ -14,13 +14,19 @@ from memory.database import PersonaMemory
 def maybe_trigger_rolling_summary(session_id: str, session_cache, memory_db: PersonaMemory) -> None:
     """每轮对话结束后调用一次：累计计数，达到阈值就异步生成一段中期摘要。
 
-    摘要内容来自 Redis 最近 N 轮热缓存，不阻塞当前请求的响应。
+    摘要素材优先取 Redis 热窗；若 Redis 空/不可用则回退到 SQLite chat_turns。
     """
     try:
         n_turns = get_summary_every_n_turns()
         turns_since_summary = memory_db.bump_turn_counter(session_id)
         if turns_since_summary >= n_turns:
-            recent_turns = session_cache.get_recent_turns(session_id, limit=n_turns)
+            recent_turns = []
+            try:
+                recent_turns = session_cache.get_recent_turns(session_id, limit=n_turns)
+            except Exception:
+                recent_turns = []
+            if not recent_turns:
+                recent_turns = memory_db.get_chat_turns(session_id, limit=n_turns)
             if recent_turns:
                 async_tasks.schedule(
                     enrichment.generate_rolling_summary,

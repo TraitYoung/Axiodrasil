@@ -25,6 +25,50 @@ app = FastAPI(title="Axiodrasil Core API", version="1.0.0")
 session_cache = SessionCache(ttl_seconds=3600, window_size=5)
 
 
+def _load_recent_history(session_id: str, limit: int = 5) -> list[str]:
+    """优先 Redis 热窗；空或失败时回退 SQLite 持久 turn。"""
+    try:
+        lines = session_cache.format_recent_history(session_id=session_id, limit=limit)
+        if lines:
+            return lines
+    except Exception:
+        pass
+    try:
+        return get_memory_db().format_chat_history(session_id, limit=limit)
+    except Exception:
+        return []
+
+
+def _persist_turn(session_id: str, user_text: str, assistant_text: str) -> None:
+    """双写：Redis 热缓存 + SQLite 冷历史（互不影响失败）。"""
+    try:
+        session_cache.append_turn(
+            session_id=session_id,
+            user_text=user_text,
+            assistant_text=assistant_text,
+        )
+    except Exception:
+        pass
+    try:
+        get_memory_db().append_chat_turn(session_id, user_text, assistant_text)
+    except Exception as e:
+        print(f"⚠️ [chat-persist] SQLite 写 turn 失败: {e}")
+
+
+def _load_history_turns(session_id: str, limit: int = 50) -> list[dict]:
+    """history/export：优先持久层；若无记录再试 Redis。"""
+    try:
+        turns = get_memory_db().get_chat_turns(session_id, limit=limit)
+        if turns:
+            return turns
+    except Exception as e:
+        print(f"⚠️ [chat-history] SQLite 读失败: {e}")
+    try:
+        return session_cache.get_recent_turns(session_id=session_id, limit=limit)
+    except Exception:
+        return []
+
+
 @app.get("/api/v1/health")
 def api_health():
     """轻量探活：供 Next 开发代理与运维脚本探测；不调用大模型。"""
@@ -88,10 +132,7 @@ def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskInten
         active_task_type = "dev_pipeline"
         active_persona = "bit"
     else:
-        try:
-            recent_history = session_cache.format_recent_history(session_id=session_id, limit=5)
-        except Exception:
-            recent_history = []
+        recent_history = _load_recent_history(session_id, limit=5)
         graph_state = {
             "current_input": payload.text,
             "thread_id": session_id,
@@ -140,15 +181,8 @@ async def chat_api(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    # 每次回复后写回 Redis，会话 TTL 维持 1 小时
-    try:
-        session_cache.append_turn(
-            session_id=session_id,
-            user_text=payload.text,
-            assistant_text=reply,
-        )
-    except Exception:
-        pass
+    # 每次回复后双写 Redis + SQLite，会话热窗 TTL 维持 1 小时
+    _persist_turn(session_id, payload.text, reply)
     maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
     trace = [TraceStep.model_validate(s) for s in trace_raw]
@@ -183,15 +217,8 @@ async def chat_stream_api(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    # 每次回复后写回 Redis，会话 TTL 维持 1 小时
-    try:
-        session_cache.append_turn(
-            session_id=session_id,
-            user_text=payload.text,
-            assistant_text=reply,
-        )
-    except Exception:
-        pass
+    # 每次回复后双写 Redis + SQLite
+    _persist_turn(session_id, payload.text, reply)
     maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
     trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
@@ -237,7 +264,7 @@ async def chat_export_api(x_session_id: str | None = Header(default=None), limit
     if not x_session_id:
         raise HTTPException(status_code=400, detail="missing x-session-id header")
 
-    turns = session_cache.get_recent_turns(session_id=x_session_id, limit=limit)
+    turns = _load_history_turns(x_session_id, limit=limit)
     if not turns:
         raise HTTPException(status_code=404, detail="no turns found for this session")
 
@@ -282,7 +309,7 @@ async def chat_history_api(x_session_id: str | None = Header(default=None), limi
     if not x_session_id:
         raise HTTPException(status_code=400, detail="missing x-session-id header")
 
-    turns_raw = session_cache.get_recent_turns(session_id=x_session_id, limit=limit)
+    turns_raw = _load_history_turns(x_session_id, limit=limit)
     if not turns_raw:
         return ChatHistoryResponse(session_id=x_session_id, turns=[])
 
@@ -390,10 +417,7 @@ async def openai_compat_chat_completions(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    try:
-        session_cache.append_turn(session_id=session_id, user_text=user_text, assistant_text=reply)
-    except Exception:
-        pass
+    _persist_turn(session_id, user_text, reply)
     maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
     created_ts = int(datetime.now(timezone.utc).timestamp())

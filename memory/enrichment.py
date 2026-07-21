@@ -89,6 +89,22 @@ def extract_and_store(
             print(f"[enrichment] 实体登记失败: {e}")
 
 
+def embed_and_store_memory(
+    memory_id: int,
+    content: str,
+    db_path: str = "./data/axiodrasil_core.db",
+) -> None:
+    """在线为一条 matrix 记忆写 embedding，避免仅依赖 scripts/migration.py 冷启动。"""
+    if not content or not str(content).strip():
+        return
+    memory_db = PersonaMemory(db_path=db_path)
+    try:
+        embedding = get_embedding(content)
+        memory_db.save_memory_embedding(memory_id, embedding.tobytes())
+    except Exception as e:
+        print(f"[enrichment] matrix 在线向量化失败（文本已落库）: {e}")
+
+
 def generate_rolling_summary(
     thread_id: str,
     turns: List[Dict[str, Any]],
@@ -139,4 +155,4 @@ def generate_rolling_summary(
     memory_db.reset_turn_counter(thread_id)
 
 
-__all__ = ["extract_and_store", "generate_rolling_summary"]
+__all__ = ["extract_and_store", "embed_and_store_memory", "generate_rolling_summary"]

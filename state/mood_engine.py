@@ -24,11 +24,12 @@ Mood / 状态引擎（内阁共享的动态状态层）。
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def _clamp(value: float, lo: float, hi: float) -> float:
@@ -44,6 +45,10 @@ def _decay_toward_zero(value: float, rate_per_min: float, minutes: float) -> flo
     return min(0.0, value + step)
 
 
+def _hooks_enabled() -> bool:
+    return os.getenv("AX_INTERACTION_HOOKS_ENABLED", "1").strip() not in ("0", "false", "False")
+
+
 # BIOS Module 0.4 作息表（去掉 Refuel 的重叠区间，按小时精确切分）
 _PERIODS: List[Tuple[int, int, str, str]] = [
     (8, 10, "morning", "自然唤醒，温和启动"),
@@ -52,6 +57,9 @@ _PERIODS: List[Tuple[int, int, str, str]] = [
     (14, 18, "focus", "高信噪比，逻辑闭环"),
     (18, 23, "free_soul", "绝对娱乐豁免，晚间家庭模式"),
 ]
+
+# BIOS：间隔超过 2 小时可触发久别欢迎
+_REUNION_GAP_MINUTES = float(os.getenv("AX_REUNION_GAP_MINUTES", "120"))
 
 
 def get_period(now: Optional[datetime] = None) -> Tuple[str, str]:
@@ -92,6 +100,8 @@ class MoodEngine:
         self.db_path = db_path
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        # 本轮 tick 前算出的交互钩子，供 get_prompt_context 消费一次
+        self._pending_hooks: Dict[str, str] = {}
 
     def _init_db(self) -> None:
         with sqlite3.connect(self.db_path) as conn:
@@ -161,6 +171,46 @@ class MoodEngine:
 
     def get_state(self, thread_id: str) -> MoodState:
         return self._load(thread_id)
+
+    def compute_interaction_hook(self, thread_id: str, now: Optional[datetime] = None) -> str:
+        """在 tick 之前调用：久别 / 每日首交互提示（BIOS Module 0.4 间歇回归）。
+
+        可通过 AX_INTERACTION_HOOKS_ENABLED=0 关闭。
+        """
+        if not _hooks_enabled():
+            return ""
+        now = now or datetime.now()
+        state = self._load(thread_id)
+        if not state.last_tick_at:
+            return "【交互提示】本会话首次交互：简洁回应即可，不必全员欢迎或寒暄堆砌。"
+        try:
+            last = datetime.fromisoformat(state.last_tick_at)
+        except ValueError:
+            return ""
+        gap_minutes = max(0.0, (now - last).total_seconds() / 60.0)
+        period_key, period_label = get_period(now)
+        if last.date() != now.date():
+            return (
+                f"【交互提示】今日首次见面（时段：{period_label}）。"
+                "可按当前时段轻轻打个招呼，一句即可，不刷屏、不列清单。"
+            )
+        if gap_minutes >= _REUNION_GAP_MINUTES:
+            return (
+                "【交互提示】距上次交互已超过两小时，可自然带一句欢迎回来"
+                "（如「忙完啦？」），只一句，勿重复热情堆砌。"
+            )
+        if period_key == "shutdown" and gap_minutes >= 30:
+            return "【交互提示】已近收尾时段，语气柔和收敛，避免高能量刺激。"
+        return ""
+
+    def arm_interaction_hook(self, thread_id: str, now: Optional[datetime] = None) -> str:
+        """计算并暂存本轮钩子，供随后 get_prompt_context 注入。"""
+        hook = self.compute_interaction_hook(thread_id, now=now)
+        if hook:
+            self._pending_hooks[thread_id] = hook
+        else:
+            self._pending_hooks.pop(thread_id, None)
+        return hook
 
     # ---------- 漂移 ----------
     def tick(self, thread_id: str, now: Optional[datetime] = None) -> MoodState:
@@ -237,7 +287,10 @@ class MoodEngine:
         _, period_label = get_period(now)
 
         pieces = [f"当前时段基调：{period_label}。"]
-        if state.connection > 0.5:
+        hook = self._pending_hooks.pop(thread_id, "")
+        if hook:
+            pieces.append(hook)
+        elif state.connection > 0.5:
             pieces.append("陛下好一阵没怎么来找内阁说话了，惦记着但不必主动提。")
         if state.valence < -0.3 and state.arousal >= 0:
             pieces.append("最近的互动透出低落，语气里少一点欢腾。")

@@ -18,6 +18,11 @@ from langgraph.prebuilt import create_react_agent
 
 from infrastructure.container import get_llm, get_memory_db, get_mood_engine
 from memory import async_tasks, enrichment
+from memory.context_inject import (
+    compose_user_message,
+    format_fragments_block,
+    format_summaries_block,
+)
 from hybrid_engine import get_hybrid_retriever
 from prompts import system_prompts
 from prompts.system_prompts import (
@@ -83,21 +88,53 @@ def _persona_prompt(persona: str, base_prompt: str, thread_id: str) -> str:
     )
 
 
+def _memory_blocks_for_reply(
+    thread_id: str,
+    *,
+    include_fragments: bool = False,
+) -> tuple[str, str]:
+    """人格回复侧：L2 摘要；闲聊/情绪路径额外带偏好事实碎片。"""
+    memory_db = get_memory_db()
+    summary_block = ""
+    fragment_block = ""
+    try:
+        summary_block = format_summaries_block(memory_db, thread_id)
+    except Exception as e:
+        print(f"⚠️ [memory] 摘要回注失败: {e}")
+    if include_fragments:
+        try:
+            fragment_block = format_fragments_block(memory_db, thread_id)
+        except Exception as e:
+            print(f"⚠️ [memory] 碎片回注失败: {e}")
+    return summary_block, fragment_block
+
+
 def _simple_agent_reply(
     *,
+    state: GraphState,
     system_prompt: str,
-    thread_id: str,
     user_status: str,
     persona: str,
     domain: str,
     fallback_prefix: str = "该节点暂时响应异常",
+    include_fragments: bool = False,
 ) -> dict:
     """Tier2/Tier3 大多数按需触发节点共用的执行逻辑：拼状态 -> 调用大模型 ->
     统一异常兜底。Bina/Jean/Bit/Chizheng 因为各自有检索/工具链/医疗红线等
     定制逻辑，单独实现，不复用这个通用壳。"""
+    thread_id = state.get("thread_id", MAIN_THREAD_ID)
+    summary_block, fragment_block = _memory_blocks_for_reply(
+        thread_id, include_fragments=include_fragments
+    )
+    human = compose_user_message(
+        user_status,
+        recent_history=state.get("recent_history", []),
+        summary_block=summary_block,
+        fragment_block=fragment_block,
+    )
     prompt_with_mood = _persona_prompt(persona, system_prompt, thread_id)
     try:
-        messages = [SystemMessage(content=prompt_with_mood), HumanMessage(content=user_status)]
+        messages = [SystemMessage(content=prompt_with_mood), HumanMessage(content=human)]
         response = get_llm().invoke(messages)
         final_text = response.content
     except Exception as e:
@@ -116,6 +153,14 @@ def node_parser(state: GraphState):
     recent_history = state.get("recent_history", [])
     history_lines = truncate_history_lines(recent_history) if recent_history else []
     history_text = "\n".join(history_lines) if history_lines else "无"
+
+    summary_text = "无"
+    try:
+        summary_block = format_summaries_block(get_memory_db(), thread_id)
+        if summary_block.strip():
+            summary_text = summary_block
+    except Exception as e:
+        print(f"⚠️ [memory] parser 摘要回注失败: {e}")
 
     system_prompt = """你是一个任务认知路由引擎。
 你必须返回合法的 JSON 结构化结果，匹配 TaskIntent 协议。
@@ -144,6 +189,9 @@ def node_parser(state: GraphState):
 只返回 JSON 内容，不要附加解释。"""
 
     human_prompt = f"""请根据规则分析下面输入，并返回符合 TaskIntent 的 json。
+
+中期会话摘要（跨窗口语境，不得覆盖 raw_input）：
+{summary_text}
 
 最近 5 轮会话记录（仅供语境参考，不得覆盖 raw_input）：
 {history_text}
@@ -174,15 +222,16 @@ def node_parser(state: GraphState):
         f"最终人格={final_persona}, 路由={resolved_route_key}"
     )
 
-    # 【状态引擎】：每轮 tick 一次数值漂移，并把 pain_level 映射为一次性情绪扰动。
+    # 【状态引擎】：先算久别/首交互钩子，再 tick；钩子由后续人格 get_prompt_context 消费。
     try:
         mood_engine = get_mood_engine()
+        mood_engine.arm_interaction_hook(thread_id)
         mood_engine.tick(thread_id)
         mood_engine.apply_pain_signal(thread_id, real_intent.pain_level)
     except Exception as e:
         print(f"⚠️ [MoodEngine] 状态更新失败（不影响主流程）: {e}")
 
-    # 【记忆写入逻辑】：Q1/Q2 才落 L3；写入后异步触发细粒度提取，不阻塞在线路径。
+    # 【记忆写入逻辑】：Q1/Q2 才落 L3；写入后异步触发细粒度提取 + 在线向量化。
     try:
         quadrant = getattr(real_intent, "quadrant", None)
         if quadrant in ["Q1", "Q2"]:
@@ -197,6 +246,11 @@ def node_parser(state: GraphState):
                 enrichment.extract_and_store,
                 thread_id=thread_id,
                 source_memory_id=memory_id,
+                content=real_intent.raw_input,
+            )
+            async_tasks.schedule(
+                enrichment.embed_and_store_memory,
+                memory_id=memory_id,
                 content=real_intent.raw_input,
             )
     except Exception as e:
@@ -256,9 +310,15 @@ def node_jean(state: GraphState):
         "请输出：1) 关键要点；2) 建议的阅读/处理路线。"
     )
 
+    summary_block, _ = _memory_blocks_for_reply(thread_id, include_fragments=False)
+    human = compose_user_message(
+        user_status,
+        recent_history=state.get("recent_history", []),
+        summary_block=summary_block,
+    )
     prompt_with_mood = _persona_prompt("jean", JEAN_PROMPT, thread_id)
     try:
-        messages = [SystemMessage(content=prompt_with_mood), HumanMessage(content=user_status)]
+        messages = [SystemMessage(content=prompt_with_mood), HumanMessage(content=human)]
         response = get_llm().invoke(messages)
         final_text = response.content
     except Exception as e:
@@ -316,9 +376,14 @@ def node_bit(state: GraphState):
 
     try:
         agent = create_react_agent(get_llm(), tools=BIT_TOOLS)
-        user_msg = (
-            f"当前任务：{intent.raw_input}\n"
-            f"系统判定痛感评级：{intent.pain_level} / 10"
+        summary_block, _ = _memory_blocks_for_reply(thread_id, include_fragments=False)
+        user_msg = compose_user_message(
+            (
+                f"当前任务：{intent.raw_input}\n"
+                f"系统判定痛感评级：{intent.pain_level} / 10"
+            ),
+            recent_history=state.get("recent_history", []),
+            summary_block=summary_block,
         )
         result = agent.invoke(
             {
@@ -362,9 +427,15 @@ def node_bina(state: GraphState):
         thread_id,
     )
 
-    user_status = (
-        f"陛下当前情绪发泄/日常闲聊：{intent.raw_input}\n"
-        f"系统判定痛感评级：{intent.pain_level} / 10"
+    summary_block, fragment_block = _memory_blocks_for_reply(thread_id, include_fragments=True)
+    user_status = compose_user_message(
+        (
+            f"陛下当前情绪发泄/日常闲聊：{intent.raw_input}\n"
+            f"系统判定痛感评级：{intent.pain_level} / 10"
+        ),
+        recent_history=state.get("recent_history", []),
+        summary_block=summary_block,
+        fragment_block=fragment_block,
     )
 
     try:
@@ -380,14 +451,13 @@ def node_bina(state: GraphState):
 def node_chizheng(state: GraphState):
     """宏观战略节点（原 Juzheng，现为 BIOS 人格 Chizheng）：结论先行的计划拆解"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = (
         f"陛下当前的战略/规划探讨：{intent.raw_input}\n"
         f"系统判定痛感评级：{intent.pain_level} / 10"
     )
     return _simple_agent_reply(
+        state=state,
         system_prompt=CHIZHENG_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="chizheng",
         domain="juzheng",
@@ -402,11 +472,10 @@ node_juzheng = node_chizheng
 def node_taki(state: GraphState):
     """逻辑防火墙节点（Tier1，Taki）：审计逻辑漏洞、结论先行"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下需要逻辑审查/复盘：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=TAKI_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="taki",
         domain="bit",
@@ -417,41 +486,40 @@ def node_taki(state: GraphState):
 def node_tianji(state: GraphState):
     """情报大臣节点（Tier2，Tianji）：购物比价/防骗/八卦"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下想问的购物/情报/八卦类问题：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=TIANJI_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="tianji",
         domain="emotion",
         fallback_prefix="情报网络暂时断线",
+        include_fragments=True,
     )
 
 
 def node_fukucho(state: GraphState):
     """纪律大臣节点（Tier2，Fukucho）：深夜软红线提醒（ACT_II，尊重主权）"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"现在已经很晚了，陛下仍在忙：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=FUKUCHO_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="fukucho",
         domain="emotion",
         fallback_prefix="纪律部门暂时失联",
+        include_fragments=True,
     )
 
 
 def node_vinci(state: GraphState):
     """艺术大臣节点（Tier2，Vinci）：仅输出极简的视觉/设计描述"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下的艺术/设计诉求：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=VINCI_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="vinci",
         domain="emotion",
@@ -462,11 +530,10 @@ def node_vinci(state: GraphState):
 def node_planck(state: GraphState):
     """数学大臣节点（Tier3，Planck）：纯代数推导，暴力美学"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下的数学问题：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=PLANCK_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="planck",
         domain="bit",
@@ -477,11 +544,10 @@ def node_planck(state: GraphState):
 def node_jiafa(state: GraphState):
     """政治大臣节点（Tier3，Jiafa）：考研政治/时政理论"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下的政治理论问题：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=JIAFA_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="jiafa",
         domain="juzheng",
@@ -492,26 +558,25 @@ def node_jiafa(state: GraphState):
 def node_qianjin(state: GraphState):
     """医官节点（Tier3，Qianjin）：非急症疲惫问诊；急症由 Bina 硬熔断处理"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下描述的疲惫/身体状态（非急症）：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=QIANJIN_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="qianjin",
         domain="emotion",
         fallback_prefix="医官暂时诊室告假",
+        include_fragments=True,
     )
 
 
 def node_boming(state: GraphState):
     """军师节点（Tier3，Boming）：非常规破局思路"""
     intent = state["intent"]
-    thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下卡住的困局：{intent.raw_input}"
     return _simple_agent_reply(
+        state=state,
         system_prompt=BOMING_PROMPT,
-        thread_id=thread_id,
         user_status=user_status,
         persona="boming",
         domain="juzheng",

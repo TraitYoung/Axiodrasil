@@ -201,6 +201,25 @@ class PersonaMemory:
                 """
             )
 
+            # 9) 会话 turn 持久化：Redis 热缓存之外的冷历史，供 history/export / 断线续聊
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chat_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT NOT NULL,
+                    user_text TEXT NOT NULL,
+                    assistant_text TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_chat_turns_thread_created
+                ON chat_turns (thread_id, created_at)
+                """
+            )
+
             conn.commit()
 
     # ==================== L3 原始记忆矩阵 ====================
@@ -217,6 +236,19 @@ class PersonaMemory:
             )
             conn.commit()
             return int(cur.lastrowid)
+
+    def save_memory_embedding(self, memory_id: int, embedding_blob: bytes) -> None:
+        """在线写入 matrix 向量；与 migration 冷启动路径共用同一表。"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_embeddings (memory_id, embedding)
+                VALUES (?, ?)
+                ON CONFLICT(memory_id) DO UPDATE SET embedding = excluded.embedding
+                """,
+                (memory_id, embedding_blob),
+            )
+            conn.commit()
 
     def get_active_q1(self, thread_id: str) -> List[str]:
         """获取指定对话下所有未完成的 Q1 (重要且紧急) 指令，用于注入上下文"""
@@ -422,3 +454,51 @@ class PersonaMemory:
     def decrypt_content(self, stored: str) -> str:
         """暴露给 hybrid_engine 等外部模块的解密入口，避免各处重复实现。"""
         return self._decrypt(stored)
+
+    # ==================== 会话 turn 持久化 ====================
+    def append_chat_turn(self, thread_id: str, user_text: str, assistant_text: str) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO chat_turns (thread_id, user_text, assistant_text)
+                VALUES (?, ?, ?)
+                """,
+                (thread_id, user_text, assistant_text),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def get_chat_turns(self, thread_id: str, limit: int = 50) -> List[Dict[str, str]]:
+        """返回旧→新的 turn 列表，字段与 SessionCache.get_recent_turns 对齐。"""
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                SELECT user_text, assistant_text, created_at
+                FROM chat_turns
+                WHERE thread_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (thread_id, max(limit, 1)),
+            )
+            rows = cur.fetchall()
+        turns: List[Dict[str, str]] = []
+        for user_text, assistant_text, created_at in reversed(rows):
+            turns.append(
+                {
+                    "user": str(user_text or ""),
+                    "assistant": str(assistant_text or ""),
+                    "ts": str(created_at or ""),
+                }
+            )
+        return turns
+
+    def format_chat_history(self, thread_id: str, limit: int = 5) -> List[str]:
+        """与 SessionCache.format_recent_history 同形，供 Redis 空时回退。"""
+        turns = self.get_chat_turns(thread_id, limit=limit)
+        lines: List[str] = []
+        for idx, turn in enumerate(turns, start=1):
+            lines.append(
+                f"Round {idx}\nUser: {turn['user']}\nAssistant: {turn['assistant']}"
+            )
+        return lines
