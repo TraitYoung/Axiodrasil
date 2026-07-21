@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from memory import crypto
 from memory.database import PersonaMemory
 from tools.ai_client import get_embedding
 
@@ -45,8 +46,11 @@ def cold_start_q2_migration(db_path: str | None = None) -> None:
             return
 
         for m_id, content in rows:
+            # 先解密再向量化：如果开启了 memory 加密（AX_MEMORY_ENC_KEY），
+            # 数据库里存的是密文，直接对密文做 embedding 会产出垃圾向量
+            plaintext = crypto.decrypt(content)
             # 2. 调用 embedding 模型 (text-embedding-3-small 或同维度模型)
-            vector = get_embedding(content)
+            vector = get_embedding(plaintext)
 
             if not isinstance(vector, np.ndarray):
                 raise TypeError("get_embedding 必须返回 numpy.ndarray")

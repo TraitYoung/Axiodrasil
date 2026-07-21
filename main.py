@@ -1,6 +1,5 @@
 from uuid import uuid4
 import hashlib
-import os
 import re
 import asyncio
 import json
@@ -13,11 +12,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents.router import app as router_graph
-from agents.router import llm as router_llm
-from agents.router import memory_db
 from agents.workflow_pipelines import run_dev_pipeline, synthetic_intent_for_workflow
-from memory import async_tasks, enrichment
+from infrastructure.container import get_llm, get_memory_db
 from memory.session_cache import SessionCache
+from memory.summary_service import maybe_trigger_rolling_summary
 from schemas.protocols import TaskIntent
 from schemas.trace import TraceStep
 from tracing.router_run import run_router_traced
@@ -25,29 +23,6 @@ from tracing.router_run import run_router_traced
 app = FastAPI(title="Axiodrasil Core API", version="1.0.0")
 
 session_cache = SessionCache(ttl_seconds=3600, window_size=5)
-
-# p1-summary：每隔 N 轮触发一次滚动摘要生成（异步，不阻塞响应）
-_SUMMARY_EVERY_N_TURNS = int(os.getenv("AX_SUMMARY_EVERY_N_TURNS", "20"))
-
-
-def _maybe_trigger_rolling_summary(session_id: str) -> None:
-    """每轮对话结束后调用一次：累计计数，达到阈值就异步生成一段中期摘要。
-
-    摘要内容来自 Redis 最近 N 轮热缓存（see memory/enrichment.py 里对"为什么不
-    强行搞全量留存"的说明），不会阻塞当前请求的响应。
-    """
-    try:
-        turns_since_summary = memory_db.bump_turn_counter(session_id)
-        if turns_since_summary >= _SUMMARY_EVERY_N_TURNS:
-            recent_turns = session_cache.get_recent_turns(session_id, limit=_SUMMARY_EVERY_N_TURNS)
-            if recent_turns:
-                async_tasks.schedule(
-                    enrichment.generate_rolling_summary,
-                    thread_id=session_id,
-                    turns=recent_turns,
-                )
-    except Exception as e:
-        print(f"⚠️ [rolling-summary] 计数/调度失败（不影响主流程）: {e}")
 
 
 @app.get("/api/v1/health")
@@ -108,7 +83,7 @@ def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskInten
     （sillytavern/extensions/persona-avatar-switch）会解析这个前缀来切头像/表情。
     """
     if payload.workflow_mode == "dev_pipeline":
-        reply_raw, trace_raw = run_dev_pipeline(payload.text, router_llm)
+        reply_raw, trace_raw = run_dev_pipeline(payload.text, get_llm())
         intent = synthetic_intent_for_workflow(payload.text, task_type="bit")
         active_task_type = "dev_pipeline"
         active_persona = "bit"
@@ -174,7 +149,7 @@ async def chat_api(
         )
     except Exception:
         pass
-    _maybe_trigger_rolling_summary(session_id)
+    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
     trace = [TraceStep.model_validate(s) for s in trace_raw]
     return ChatResponse(
@@ -217,7 +192,7 @@ async def chat_stream_api(
         )
     except Exception:
         pass
-    _maybe_trigger_rolling_summary(session_id)
+    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
     trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
 
@@ -419,10 +394,14 @@ async def openai_compat_chat_completions(
         session_cache.append_turn(session_id=session_id, user_text=user_text, assistant_text=reply)
     except Exception:
         pass
-    _maybe_trigger_rolling_summary(session_id)
+    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
     created_ts = int(datetime.now(timezone.utc).timestamp())
     completion_id = f"chatcmpl-{uuid4().hex[:24]}"
+
+    # 粗估 token 数（4 字符 ≈ 1 token），让客户端的 token 统计不全是 0
+    est_prompt_tokens = max(1, len(user_text) // 4)
+    est_completion_tokens = max(1, len(reply) // 4)
 
     if payload.stream:
         async def event_gen():
@@ -472,5 +451,9 @@ async def openai_compat_chat_completions(
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": {
+            "prompt_tokens": est_prompt_tokens,
+            "completion_tokens": est_completion_tokens,
+            "total_tokens": est_prompt_tokens + est_completion_tokens,
+        },
     }

@@ -40,7 +40,8 @@ def run_router_traced(graph, graph_state: Dict[str, Any]) -> Tuple[Dict[str, Any
     执行编译后的 LangGraph，返回与 invoke 等价的累积 state 与追踪步骤列表。
     在 parser 之后会追加一步 __router__（与 route_by_intent 一致），便于对齐条件边。
     """
-    from agents.router import ROUTE_TO_NODE, route_by_intent
+    from agents.persona_meta import ROUTE_TO_NODE
+    from agents.route_resolver import route_by_intent
 
     accumulated: Dict[str, Any] = {**graph_state}
     steps: List[Dict[str, Any]] = []

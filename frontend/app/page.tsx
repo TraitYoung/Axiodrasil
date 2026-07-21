@@ -22,6 +22,7 @@ type SSEMsg =
       intent: Intent;
       trace_id?: string;
       trace?: TraceStepRow[];
+      active_persona?: string;
     }
   | { type: "delta"; content: string }
   | { type: "done" };
@@ -34,6 +35,7 @@ function isChatMeta(
   trace_id?: string;
   trace?: TraceStepRow[];
   workflow_mode?: string;
+  active_persona?: string;
 } {
   return "session_id" in obj && "intent" in obj;
 }
@@ -52,6 +54,23 @@ function safeParseJson(line: string): unknown | null {
   }
 }
 
+// 11 人 BIOS 阵容 + Jean 的显示名映射
+const PERSONA_DISPLAY: Record<string, string> = {
+  bina: "情绪（Bina）",
+  bit: "代码（Bit）",
+  taki: "逻辑防火墙（Taki）",
+  chizheng: "战略（郅政）",
+  tianji: "情报（天机）",
+  fukucho: "纪律（副长）",
+  vinci: "艺术（达文西）",
+  planck: "数学（普朗克）",
+  jiafa: "政治（稼发）",
+  qianjin: "医官（千金）",
+  boming: "军师（伯明）",
+  jean: "文档（Jean）",
+  dev: "开发流水线",
+};
+
 function agentName(taskType?: string) {
   switch (taskType) {
     case "emotion":
@@ -65,6 +84,11 @@ function agentName(taskType?: string) {
     default:
       return "未知";
   }
+}
+
+function personaDisplayName(persona?: string): string {
+  if (!persona) return "未知";
+  return PERSONA_DISPLAY[persona] || persona;
 }
 
 type UiMode = "chat" | "clean" | "dev_pipeline";
@@ -339,6 +363,7 @@ export default function Home() {
           if (isChatMeta(parsed)) {
             const wf = parsed.workflow_mode;
             if (wf === "dev_pipeline") setActiveAgent("AI 软件工程流水线");
+            else if (parsed.active_persona) setActiveAgent(personaDisplayName(parsed.active_persona));
             else setActiveAgent(agentName(parsed.intent?.task_type));
             if (parsed.trace_id) setTraceId(parsed.trace_id);
             if (parsed.trace && Array.isArray(parsed.trace)) setTraceSteps(parsed.trace);

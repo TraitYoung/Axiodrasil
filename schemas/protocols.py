@@ -23,16 +23,9 @@ PersonaName = Literal[
     "jean",
 ]
 
-# domain -> 默认执勤人格。domain 是粗分类（兼容现有 4 类路由），persona 是
-# 11+1 人格里具体哪一个；route_by_intent 先按 domain 粗分发，再由关键词触发/
-# 召唤协议/双重权重机制在节点内部精细化到具体 persona。
-DOMAIN_DEFAULT_PERSONA: dict[str, PersonaName] = {
-    "emotion": "bina",
-    "jean": "jean",
-    "bit": "bit",
-    "juzheng": "chizheng",
-    "unknown": "chizheng",
-}
+# 注意：DOMAIN_DEFAULT_PERSONA 已迁移到 agents/persona_meta.py，
+# 由 agents/route_resolver.py 和 agents/router.py 统一导入。
+# 此处仅保留 PersonaName 类型定义供 schemas 层使用。
 
 
 class TaskIntent(BaseModel):

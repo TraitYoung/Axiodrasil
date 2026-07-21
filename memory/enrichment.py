@@ -8,31 +8,14 @@
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 
+from infrastructure.container import get_enrichment_extraction_llm, get_enrichment_llm
 from memory.database import PersonaMemory
 from schemas.memory import MemoryExtraction
 from tools.ai_client import get_embedding
-
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(_PROJECT_ROOT / ".env")
-
-_api_key = os.getenv("QWEN_API_KEY")
-_ENRICHMENT_MODEL = os.getenv("AX_ENRICHMENT_MODEL", "qwen-turbo")
-
-_extraction_llm = None
-if _api_key:
-    _extraction_llm = ChatOpenAI(
-        model=_ENRICHMENT_MODEL,
-        api_key=_api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    ).with_structured_output(MemoryExtraction)
 
 
 def extract_and_store(
@@ -47,14 +30,15 @@ def extract_and_store(
     设计为「失败不影响主流程」：任何一步异常只打印日志并 return，因为这个
     函数总是在后台任务里跑，调用方早已把响应还给用户了。
     """
-    if _extraction_llm is None:
+    extraction_llm = get_enrichment_extraction_llm()
+    if extraction_llm is None:
         print("[enrichment] 未配置 QWEN_API_KEY，跳过细粒度提取。")
         return
 
     memory_db = PersonaMemory(db_path=db_path)
 
     try:
-        result: MemoryExtraction = _extraction_llm.invoke(
+        result: MemoryExtraction = extraction_llm.invoke(
             [
                 SystemMessage(
                     content=(
@@ -117,14 +101,9 @@ def generate_rolling_summary(
     "全量底片"。摘要只是把 Redis 5 轮窗口之外、L3 长期记忆之内的中期信息
     补一层，属于"力所能及范围内"的滚动摘要，不是不可篡改的完整历史。
     """
-    if not _api_key or not turns:
+    llm = get_enrichment_llm()
+    if llm is None or not turns:
         return
-
-    llm = ChatOpenAI(
-        model=_ENRICHMENT_MODEL,
-        api_key=_api_key,
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-    )
 
     transcript = "\n".join(
         f"User: {t.get('user', '')}\nAssistant: {t.get('assistant', '')}" for t in turns

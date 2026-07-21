@@ -1,19 +1,24 @@
-import os
-import re
-from datetime import datetime
-from pathlib import Path
-from typing import List, NotRequired, Optional, TypedDict
+"""
+LangGraph 路由引擎：图状态定义 + 节点实现 + 图组装。
 
-from dotenv import load_dotenv
-from langchain_openai import ChatOpenAI
+基础设施（LLM/记忆/状态引擎实例）从 infrastructure.container 获取，
+人格元数据/路由表从 agents.persona_meta 获取，
+路由决策逻辑从 agents.route_resolver 获取。
+本文件只负责节点行为与图结构。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import List, NotRequired, TypedDict
+
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.prebuilt import create_react_agent
-from langchain_core.messages import HumanMessage, SystemMessage
 
-from memory.database import PersonaMemory
+from infrastructure.container import get_llm, get_memory_db, get_mood_engine
 from memory import async_tasks, enrichment
-from hybrid_engine import HybridRetriever
-from state.mood_engine import MoodEngine
+from hybrid_engine import get_hybrid_retriever
 from prompts import system_prompts
 from prompts.system_prompts import (
     BINA_MEDICAL_REDLINE_BLOCK,
@@ -31,13 +36,21 @@ from prompts.system_prompts import (
     VINCI_PROMPT,
 )
 from config.context_budget import JEAN_MATERIALS_MAX_CHARS, truncate_history_lines
-from schemas.protocols import DOMAIN_DEFAULT_PERSONA, TaskIntent
+from schemas.protocols import TaskIntent
 from tools.agent_tools import BIT_TOOLS, execute_python
 from tools.ai_client import get_embedding
 
-# 初始化记忆中枢 + 状态引擎（跨人格共享，见 state/mood_engine.py）
-memory_db = PersonaMemory()
-mood_engine = MoodEngine()
+# ── 从解耦模块 re-export，保持外部引用兼容 ───────────────────────────
+from agents.persona_meta import (
+    DOMAIN_DEFAULT_PERSONA,
+    PERSONA_META,
+    PERSONA_TO_ROUTE,
+    ROUTE_TO_NODE,
+    SUMMON_ALIASES,
+)
+from agents.route_resolver import resolve_route as _resolve_route
+from agents.route_resolver import route_by_intent
+
 # 给主线任务设定一个固定的 Thread ID
 MAIN_THREAD_ID = "TraitYoung_Main"
 
@@ -57,173 +70,12 @@ class GraphState(TypedDict):
     resolved_route_key: NotRequired[str]
 
 
-# 2. 从内存中安全提取密钥
-# 显式加载项目根目录下的 .env，避免运行目录变化时读取失败
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
-api_key = os.getenv("QWEN_API_KEY")
-if not api_key:
-    raise ValueError("未检测到 QWEN_API_KEY，请检查 .env 文件！")
-
-# 初始化大模型大脑（兼容 OpenAI 协议，可换成任意兼容模型）
-llm = ChatOpenAI(
-    model="qwen-plus",
-    api_key=api_key,
-    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-
-# 【核心功能】：将 Pydantic 协议绑定到 LLM 上
-# 这行代码意味着：无论 LLM 怎么胡说八道，它最终必须吐出一个完美的 TaskIntent 对象
-parser_llm = llm.with_structured_output(TaskIntent)
-
-
-# ==========================================
-# 人格元数据 + 路由表（Phase 2：内阁扩员至 BIOS 完整阵容）
-# ==========================================
-
-# BIOS Module 3 名片格式："中文小名 (职务)"；Phase 3 的 SillyTavern 前缀解析/
-# 头像切换也会用到这个映射。
-PERSONA_META: dict[str, tuple[str, str]] = {
-    "bina": ("Bina", "首席私人秘书"),
-    "bit": ("Bit", "技术负责人"),
-    "taki": ("Taki", "逻辑防火墙"),
-    "chizheng": ("郅政", "首席战略官"),
-    "tianji": ("天机", "情报大臣"),
-    "fukucho": ("副长", "纪律大臣"),
-    "vinci": ("达文西", "艺术大臣"),
-    "planck": ("普朗克", "数学大臣"),
-    "jiafa": ("稼发", "政治大臣"),
-    "qianjin": ("千金", "医官"),
-    "boming": ("伯明", "军师"),
-    "jean": ("Jean", "文档管理官"),
-}
-
-# 召唤协议「传 [Name]」的别名表：中英文/历史命名都能命中
-SUMMON_ALIASES: dict[str, str] = {
-    "bina": "bina",
-    "bit": "bit",
-    "taki": "taki",
-    "chizheng": "chizheng",
-    "郅政": "chizheng",
-    "居正": "chizheng",
-    "juzheng": "chizheng",
-    "tianji": "tianji",
-    "天机": "tianji",
-    "fukucho": "fukucho",
-    "副长": "fukucho",
-    "vinci": "vinci",
-    "达文西": "vinci",
-    "planck": "planck",
-    "普朗克": "planck",
-    "jiafa": "jiafa",
-    "稼发": "jiafa",
-    "qianjin": "qianjin",
-    "千金": "qianjin",
-    "boming": "boming",
-    "伯明": "boming",
-    "jean": "jean",
-}
-
-# persona -> 条件边路由 key（供召唤协议 / 多样性补丁直接查表）
-PERSONA_TO_ROUTE: dict[str, str] = {
-    "bina": "emotion_route",
-    "jean": "jean_route",
-    "bit": "bit_route",
-    "taki": "taki_route",
-    "chizheng": "juzheng_route",
-    "tianji": "tianji_route",
-    "fukucho": "fukucho_route",
-    "vinci": "vinci_route",
-    "planck": "planck_route",
-    "jiafa": "jiafa_route",
-    "qianjin": "qianjin_route",
-    "boming": "boming_route",
-}
-
-# 条件边路由 key -> 图节点名（tracing/router_run.py 复用这张表还原 __router__ 步骤）
-ROUTE_TO_NODE: dict[str, str] = {
-    "emotion_route": "emotion_agent",
-    "jean_route": "jean_agent",
-    "bit_route": "bit_agent",
-    "juzheng_route": "juzheng_agent",
-    "taki_route": "taki_agent",
-    "tianji_route": "tianji_agent",
-    "fukucho_route": "fukucho_agent",
-    "vinci_route": "vinci_agent",
-    "planck_route": "planck_agent",
-    "jiafa_route": "jiafa_agent",
-    "qianjin_route": "qianjin_agent",
-    "boming_route": "boming_agent",
-    "debate_route": "debate_agent",
-}
-
-_SUMMON_PATTERN = re.compile(r"传\s*([A-Za-z\u4e00-\u9fa5]{1,6})")
-
-# 各类关键词触发表（MVP 启发式规则，先跑起来，后续可按体感调参/升级为分类模型）
-CLEANING_KEYWORDS = ["json", "jsonl", "清洗", "归档", "sft", "logs", "log", "system instruction"]
-FATIGUE_KEYWORDS = ["好累", "不想动", "困", "没精神", "没力气", "头疼", "腰疼", "肩颈疼"]
-SHOPPING_KEYWORDS = ["值不值", "值得买", "要不要买", "防骗", "避雷", "劝退", "哪个牌子", "谁家的", "种草"]
-ART_KEYWORDS = ["配色", "排版", "设计感", "画一个", "logo", "字体设计", "视觉稿", "画面感"]
-TAKI_KEYWORDS = ["审计", "逻辑漏洞", "理一下逻辑", "复盘逻辑", "数据整洁", "归档整理一下"]
-MATH_KEYWORDS = ["积分", "矩阵", "证明一下", "概率论", "线性代数", "微分方程", "级数"]
-POLITICS_KEYWORDS = ["马原", "毛概", "史纲", "思修", "考研政治", "时政热点"]
-BOMING_KEYWORDS = ["破局", "有什么妙计", "帮我出个主意", "山人", "锦囊"]
-CONTINUED_WORK_KEYWORDS = ["学习", "复习", "敲代码", "写代码", "写作业", "肝", "赶进度", "写论文", "刷题"]
-INDULGENCE_KEYWORDS = ["想买", "犒劳自己", "奖励自己", "剁手"]
-CONFLICT_KEYWORDS = ["贵", "纠结", "要不要", "值不值", "花这个钱"]
-
-_DIVERSITY_PATCH_ENABLED = os.getenv("AX_DIVERSITY_PATCH_ENABLED", "1").strip() not in ("0", "false", "off")
-_DIVERSITY_PATCH_PROB = float(os.getenv("AX_DIVERSITY_PATCH_PROB", "0.15"))
-_DIVERSITY_CANDIDATES = ["tianji", "qianjin", "vinci"]
-
-
-def _match_summon(text: str) -> Optional[str]:
-    """召唤协议：「传 [Name]」，优先级高于一切触发逻辑（BIOS Module 2.1），
-    但不能绕过 pain_level > 6 的医疗安全熔断（在 route_by_intent 里排在更前面）。"""
-    m = _SUMMON_PATTERN.search(text)
-    if not m:
-        return None
-    token = m.group(1).strip()
-    return SUMMON_ALIASES.get(token) or SUMMON_ALIASES.get(token.lower())
-
-
-def _is_late_night(now: datetime) -> bool:
-    """BIOS ACT_II 软红线触发时段：23:30 之后，到次日 6 点前都算"仍在熬"。"""
-    if now.hour == 23 and now.minute >= 30:
-        return True
-    return 0 <= now.hour < 6
-
-
-def _detect_debate(text: str) -> bool:
-    """BIOS Module 2.1 冲突规则：只有当"逻辑"与"直觉"冲突时，才允许 Bit 和
-    Bina 同时发言辩论。启发式判定：同时出现"想买/犒劳自己"类indulgence 词与
-    "贵/纠结/值不值"类冲突词。"""
-    return any(k in text for k in INDULGENCE_KEYWORDS) and any(k in text for k in CONFLICT_KEYWORDS)
-
-
-def _maybe_diversity_patch(intent: TaskIntent) -> Optional[str]:
-    """BIOS Module 5.7 双重权重机制里的"多样性补丁"：闲聊/噪音象限下，
-    小概率把默认执勤官（Bina）换成低频角色，增加内阁的"人气分布"。
-    只在没有任何专业/专项关键词命中、纯粹落到 emotion 默认分支时才生效。
-
-    重要：这个函数带随机数，只允许在 `_resolve_route` 里被调用恰好一次
-    （node_parser 阶段），结果落盘进 `resolved_route_key` 后，
-    `route_by_intent` 只做确定性查表——否则「实际路由」与
-    `tracing/router_run.py` 的重放调用会各自抽一次随机数，可能得到不一致
-    的结果。"""
-    if not _DIVERSITY_PATCH_ENABLED:
-        return None
-    if intent.quadrant not in ("Q3", "Q4"):
-        return None
-    import random
-
-    if random.random() >= _DIVERSITY_PATCH_PROB:
-        return None
-    return random.choice(_DIVERSITY_CANDIDATES)
-
+# 2. 通用工具函数 ───────────────────────────────────────────────────
 
 def _persona_prompt(persona: str, base_prompt: str, thread_id: str) -> str:
     """把 mood_engine 的状态描述统一拼进任意人格的 system prompt，实现
     「固定人格 + 动态状态 + 动态记忆」三层叠加里的第二层，跨节点共享。"""
+    mood_engine = get_mood_engine()
     return system_prompts.with_mood_context(
         base_prompt,
         mood_engine.get_prompt_context(thread_id),
@@ -246,12 +98,14 @@ def _simple_agent_reply(
     prompt_with_mood = _persona_prompt(persona, system_prompt, thread_id)
     try:
         messages = [SystemMessage(content=prompt_with_mood), HumanMessage(content=user_status)]
-        response = llm.invoke(messages)
+        response = get_llm().invoke(messages)
         final_text = response.content
     except Exception as e:
         final_text = f"{fallback_prefix}。 (Error: {e})"
     return {"final_response": final_text, "active_task_type": domain, "active_persona": persona}
 
+
+# 3. 节点实现 ───────────────────────────────────────────────────────
 
 def node_parser(state: GraphState):
     """解析用户意图，并在需要时写入 Q1/Q2 级别的记忆"""
@@ -263,7 +117,6 @@ def node_parser(state: GraphState):
     history_lines = truncate_history_lines(recent_history) if recent_history else []
     history_text = "\n".join(history_lines) if history_lines else "无"
 
-    # 将隐式 Schema 约束升级为显式系统指令，避免模型输出协议外字段
     system_prompt = """你是一个任务认知路由引擎。
 你必须返回合法的 JSON 结构化结果，匹配 TaskIntent 协议。
 
@@ -298,13 +151,13 @@ def node_parser(state: GraphState):
 用户输入：
 {user_input}"""
 
-    # 将系统指令与用户输入打包
     messages = [
         SystemMessage(content=system_prompt),
         HumanMessage(content=human_prompt),
     ]
 
-    # 扔给绑定了 Pydantic 协议的 LLM
+    llm = get_llm()
+    parser_llm = llm.with_structured_output(TaskIntent)
     real_intent = parser_llm.invoke(messages)
 
     # 【persona 分层】：不信任大模型对 11 个人格的分类稳定性，先用确定性规则
@@ -322,8 +175,8 @@ def node_parser(state: GraphState):
     )
 
     # 【状态引擎】：每轮 tick 一次数值漂移，并把 pain_level 映射为一次性情绪扰动。
-    # 不需要额外跑情绪分类模型——直接复用已有的结构化痛感指标。
     try:
+        mood_engine = get_mood_engine()
         mood_engine.tick(thread_id)
         mood_engine.apply_pain_signal(thread_id, real_intent.pain_level)
     except Exception as e:
@@ -333,6 +186,7 @@ def node_parser(state: GraphState):
     try:
         quadrant = getattr(real_intent, "quadrant", None)
         if quadrant in ["Q1", "Q2"]:
+            memory_db = get_memory_db()
             memory_id = memory_db.save_memory(
                 thread_id=thread_id,
                 content=real_intent.raw_input,
@@ -357,7 +211,7 @@ def node_jean(state: GraphState):
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
     query = intent.raw_input
 
-    retriever = HybridRetriever()
+    retriever = get_hybrid_retriever()
     query_embedding = None
     try:
         query_embedding = get_embedding(query)
@@ -372,7 +226,6 @@ def node_jean(state: GraphState):
             thread_id=thread_id,
             quadrant="Q2",
         )
-        # 当前会话尚无 Q2 时，再查全库 Q2（无需改 x-session-id 也能命中迁移/脚本写入的样本）
         if not docs:
             docs = retriever.search_hybrid(
                 query=query,
@@ -392,7 +245,6 @@ def node_jean(state: GraphState):
                 for i, d in enumerate(docs)
             ]
         )
-        # 控制 prompt 长度，避免材料过长（预算见 config/context_budget.py）
         if len(materials_text) > JEAN_MATERIALS_MAX_CHARS:
             materials_text = materials_text[:JEAN_MATERIALS_MAX_CHARS] + "..."
     else:
@@ -407,7 +259,7 @@ def node_jean(state: GraphState):
     prompt_with_mood = _persona_prompt("jean", JEAN_PROMPT, thread_id)
     try:
         messages = [SystemMessage(content=prompt_with_mood), HumanMessage(content=user_status)]
-        response = llm.invoke(messages)
+        response = get_llm().invoke(messages)
         final_text = response.content
     except Exception as e:
         final_text = f"文档管理节点执行失败，无法完成整理。 (Error: {e})"
@@ -421,17 +273,8 @@ def node_bit(state: GraphState):
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
     raw_input_lower = intent.raw_input.lower()
 
-    # 意图优先执行：命中日志清洗/SFT飞轮关键词时，先触发本地流水线脚本
     sft_intent_keywords = [
-        "sft",
-        "训练数据",
-        "jsonl",
-        "日志清洗",
-        "log",
-        "logs",
-        "归档",
-        "archive",
-        "system instruction",
+        "sft", "训练数据", "jsonl", "日志清洗", "log", "logs", "归档", "archive", "system instruction",
     ]
     if any(k in raw_input_lower for k in sft_intent_keywords):
         pipeline_code = (
@@ -445,7 +288,7 @@ def node_bit(state: GraphState):
         try:
             run_result = execute_python.invoke({"code": pipeline_code})
             final_text = (
-                "已命中“日志清洗 -> SFT -> 归档”用户意图，已优先执行自动流水线：\n\n"
+                '已命中「日志清洗 -> SFT -> 归档」用户意图，已优先执行自动流水线：\n\n'
                 f"{run_result}\n\n"
                 "如需自定义路径或 system instruction，请继续给我参数：\n"
                 "- --input-dir / --output-dir / --archive-dir\n"
@@ -455,7 +298,7 @@ def node_bit(state: GraphState):
             final_text = f"命中优先执行意图，但流水线执行失败。 (Error: {e})"
         return {"final_response": final_text, "active_task_type": "bit", "active_persona": "bit"}
 
-    # 1. 唤醒 L3 记忆库里的 Q1 警告（用于安全上下文）
+    memory_db = get_memory_db()
     active_q1_tasks = memory_db.get_active_q1(thread_id)
     context_injection = "无历史遗留高危任务。"
     if active_q1_tasks:
@@ -465,7 +308,6 @@ def node_bit(state: GraphState):
         for task in active_q1_tasks:
             context_injection += f"- {task}\n"
 
-    # 2. 技术节点 System Prompt（叠加状态引擎）
     bit_prompt = _persona_prompt(
         "bit",
         f"{BIT_SYSTEM_PROMPT}\n\n【上下文记忆】：\n{context_injection}",
@@ -473,15 +315,11 @@ def node_bit(state: GraphState):
     )
 
     try:
-        # 3. 组装 LangGraph 原生 ReAct Agent
-        agent = create_react_agent(llm, tools=BIT_TOOLS)
-
-        # 4. 执行任务：显式注入 System Prompt + 用户请求
+        agent = create_react_agent(get_llm(), tools=BIT_TOOLS)
         user_msg = (
             f"当前任务：{intent.raw_input}\n"
             f"系统判定痛感评级：{intent.pain_level} / 10"
         )
-
         result = agent.invoke(
             {
                 "messages": [
@@ -490,10 +328,7 @@ def node_bit(state: GraphState):
                 ]
             }
         )
-
         final_text = result["messages"][-1].content
-
-        # 末尾自检清单（让演示更像工程交付）
         final_text += (
             "\n\n---\n**Checklist (Bit 预检):**\n"
             "- [ ] 边界测试\n- [ ] 逻辑闭环\n- [ ] 内存安全"
@@ -507,13 +342,11 @@ def node_bit(state: GraphState):
 def node_bina(state: GraphState):
     """情感疏导节点：处理 emotion 任务，提供高情绪价值，动态切换颜文字。
 
-    p2-health-split：好累/不想动等一般疲惫已改由 Qianjin 问诊节点接管（见
-    route_by_intent），这里只保留 pain_level > 6 的急症级硬熔断，作为不可被
-    召唤协议绕过的安全兜底。"""
+    p2-health-split：好累/不想动等一般疲惫已改由 Qianjin 问诊节点接管，
+    这里只保留 pain_level > 6 的急症级硬熔断。"""
     intent = state["intent"]
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
 
-    # 动态时间感知 (决定视觉协议)
     is_working_hour = 10 <= datetime.now().hour < 18
     visual_rule = (
         "当前为【工作时间】。视觉限制：禁止使用颜文字、波浪号，保持干练但温暖。"
@@ -521,17 +354,14 @@ def node_bina(state: GraphState):
         else "当前为【休息/深夜时间】。视觉解锁：允许并鼓励使用可爱颜文字(≧∇≦)，释放高能量！"
     )
 
-    # 若触发医疗红线，则由 emotion 负责接管并阻断工作流
     medical_block = BINA_MEDICAL_REDLINE_BLOCK if intent.pain_level > 6 else ""
 
-    # 将动态规则 + 医疗红线填入模板，再叠加状态引擎
     bina_prompt = _persona_prompt(
         "bina",
         BINA_PROMPT_TEMPLATE.format(visual_rule=visual_rule, medical_block=medical_block),
         thread_id,
     )
 
-    # 组装上下文并请求大模型
     user_status = (
         f"陛下当前情绪发泄/日常闲聊：{intent.raw_input}\n"
         f"系统判定痛感评级：{intent.pain_level} / 10"
@@ -539,7 +369,7 @@ def node_bina(state: GraphState):
 
     try:
         messages = [SystemMessage(content=bina_prompt), HumanMessage(content=user_status)]
-        response = llm.invoke(messages)
+        response = get_llm().invoke(messages)
         final_text = response.content
     except Exception as e:
         final_text = f"呜呜，陛下的情绪电波太强，Bina 的线路稍微短路了一下... (Error: {e})"
@@ -565,7 +395,7 @@ def node_chizheng(state: GraphState):
     )
 
 
-# 保留旧函数名作为别名，避免遗漏改名的外部引用（如脚本/测试）直接崩掉
+# 保留旧函数名作为别名，避免遗漏改名的外部引用
 node_juzheng = node_chizheng
 
 
@@ -675,7 +505,7 @@ def node_qianjin(state: GraphState):
 
 
 def node_boming(state: GraphState):
-    """军师节点（Tier3，Boming）：非常规破局思路，与 Chizheng 的执行力路线互补"""
+    """军师节点（Tier3，Boming）：非常规破局思路"""
     intent = state["intent"]
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
     user_status = f"陛下卡住的困局：{intent.raw_input}"
@@ -690,100 +520,20 @@ def node_boming(state: GraphState):
 
 
 def node_debate(state: GraphState):
-    """冲突辩论出口（BIOS Module 2.1）：仅当逻辑（Bit）与直觉（Bina）冲突时，
-    两者同场发言，不做仲裁，把两个视角都甩给陛下自己判断。"""
-    bit_result = node_bit(state)
-    bina_result = node_bina(state)
+    """冲突辩论出口（BIOS Module 2.1）：Bit 与 Bina 并行发言。"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        bit_future = pool.submit(node_bit, state)
+        bina_future = pool.submit(node_bina, state)
+        bit_result = bit_future.result()
+        bina_result = bina_future.result()
+
     combined = (
         f"[bit]: {bit_result.get('final_response', '')}\n\n"
         f"[bina]: {bina_result.get('final_response', '')}"
     )
     return {"final_response": combined, "active_task_type": "emotion", "active_persona": "bina"}
-
-
-def _resolve_route(intent: TaskIntent, current_input: str, now: datetime) -> tuple[str, str]:
-    """一次性算出 (persona, route_key)。只应该在 node_parser 里被调用一次——
-    因为 `_maybe_diversity_patch` 带随机数，多次调用可能得到不同结果。
-    `route_by_intent` 本身只做确定性查表，见下方定义。"""
-    lower_input = current_input.lower()
-
-    # 0. 安全底线：医疗硬熔断，任何协议（包括召唤协议）都不能覆盖
-    if intent.pain_level > 6:
-        return "bina", "emotion_route"
-
-    # 1. 召唤协议：「传 [Name]」显式指定，最高优先级（BIOS Module 2.1）
-    summon_persona = _match_summon(current_input)
-    if summon_persona:
-        return summon_persona, PERSONA_TO_ROUTE[summon_persona]
-
-    # 2. 清洗流水线优先：命中数据清洗/归档关键词时强制走 bit（沿用既有行为）
-    if any(k in lower_input for k in CLEANING_KEYWORDS):
-        return "bit", "bit_route"
-
-    # 3. 冲突辩论：逻辑（Bit）与直觉（Bina）同时命中时才触发
-    if _detect_debate(current_input):
-        return "bina", "debate_route"
-
-    # 4. Fukucho 深夜软红线：深夜 + 仍在持续学习/工作
-    if _is_late_night(now) and any(k in current_input for k in CONTINUED_WORK_KEYWORDS):
-        return "fukucho", "fukucho_route"
-
-    # 5. Qianjin 非急症疲惫问诊（能走到这里说明 pain_level <= 6，安全）
-    if any(k in current_input for k in FATIGUE_KEYWORDS):
-        return "qianjin", "qianjin_route"
-
-    # 6. Tianji 购物/防骗/八卦
-    if any(k in current_input for k in SHOPPING_KEYWORDS):
-        return "tianji", "tianji_route"
-
-    # 7. Vinci 艺术/设计
-    if any(k in current_input for k in ART_KEYWORDS):
-        return "vinci", "vinci_route"
-
-    # 8. bit domain 内的精细化：Taki（逻辑审计）/ Planck（数学）/ 默认 Bit
-    if intent.task_type == "bit":
-        if any(k in current_input for k in MATH_KEYWORDS):
-            return "planck", "planck_route"
-        if any(k in current_input for k in TAKI_KEYWORDS):
-            return "taki", "taki_route"
-        return "bit", "bit_route"
-
-    # 9. juzheng domain 内的精细化：Jiafa（政治）/ Boming（非常规破局）/ 默认 Chizheng
-    if intent.task_type == "juzheng":
-        if any(k in current_input for k in POLITICS_KEYWORDS):
-            return "jiafa", "jiafa_route"
-        if any(k in current_input for k in BOMING_KEYWORDS):
-            return "boming", "boming_route"
-        return "chizheng", "juzheng_route"
-
-    # 10. jean domain：文档/RAG，无需精细化
-    if intent.task_type == "jean":
-        return "jean", "jean_route"
-
-    # 11. emotion domain 默认分支：先看多样性补丁，否则回落 Bina
-    if intent.task_type == "emotion":
-        diversity_persona = _maybe_diversity_patch(intent)
-        if diversity_persona:
-            return diversity_persona, PERSONA_TO_ROUTE[diversity_persona]
-        return "bina", "emotion_route"
-
-    # unknown 兜底：沿用既有行为，落到 Chizheng
-    return "chizheng", "juzheng_route"
-
-
-def route_by_intent(state: GraphState) -> str:
-    """条件边使用的路由函数。真正的路由决策已经在 node_parser 阶段通过
-    `_resolve_route` 算好并存进 `resolved_route_key`，这里只做确定性查表，
-    保证同一轮对话被问多次（比如 tracing 重放）时结果稳定一致。"""
-    resolved = state.get("resolved_route_key")
-    if resolved:
-        return resolved
-
-    # 兜底：如果状态里没有 resolved_route_key（例如手工构造的局部 state），
-    # 退化为「仅按 persona 查表」，不再重新触发随机的多样性补丁。
-    intent = state.get("intent")
-    persona = getattr(intent, "persona", None) if intent is not None else None
-    return PERSONA_TO_ROUTE.get(persona or "chizheng", "juzheng_route")
 
 
 # 4. 构建图 (Build the Graph)
@@ -806,7 +556,6 @@ workflow.add_node("debate_agent", node_debate)
 
 workflow.set_entry_point("parser")
 
-# 添加条件边：从 parser 出发，根据 route_by_intent 的返回值走向不同的节点
 workflow.add_conditional_edges(
     "parser",
     route_by_intent,
@@ -828,21 +577,11 @@ workflow.add_conditional_edges(
 )
 
 for _node_name in [
-    "emotion_agent",
-    "jean_agent",
-    "bit_agent",
-    "juzheng_agent",
-    "taki_agent",
-    "tianji_agent",
-    "fukucho_agent",
-    "vinci_agent",
-    "planck_agent",
-    "jiafa_agent",
-    "qianjin_agent",
-    "boming_agent",
+    "emotion_agent", "jean_agent", "bit_agent", "juzheng_agent",
+    "taki_agent", "tianji_agent", "fukucho_agent", "vinci_agent",
+    "planck_agent", "jiafa_agent", "qianjin_agent", "boming_agent",
     "debate_agent",
 ]:
     workflow.add_edge(_node_name, END)
 
-# 编译图谱
 app = workflow.compile()

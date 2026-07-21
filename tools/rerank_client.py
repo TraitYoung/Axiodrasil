@@ -95,15 +95,11 @@ def maybe_rerank(query: str, docs: List[Dict[str, Any]], final_top_k: int) -> Li
         return docs[:final_top_k]
 
     reordered: List[Dict[str, Any]] = []
-    seen_ids: set[Any] = set()
+    seen_indices: set[int] = set()
     for i in indices:
-        if 0 <= i < len(docs):
-            d = docs[i]
-            mid = d.get("id")
-            if mid in seen_ids:
-                continue
-            seen_ids.add(mid)
-            reordered.append(d)
+        if 0 <= i < len(docs) and i not in seen_indices:
+            seen_indices.add(i)
+            reordered.append(docs[i])
     if not reordered:
         return docs[:final_top_k]
 

@@ -57,8 +57,12 @@ class HybridRetriever:
         """
         # NOTE: 默认 FTS5 分词器对中文支持一般，建议后续通过迁移脚本
         # 对历史数据进行 jieba 预分词后再写入 FTS 表。
+
+        # 转义 FTS5 特殊字符：将用户 query 包裹为 phrase query，
+        # 避免含 " * : NEAR 等字符时抛 OperationalError
+        safe_query = '"' + query.replace('"', '""') + '"'
         conditions = ["memory_fts MATCH ?"]
-        params: List[Any] = [query]
+        params: List[Any] = [safe_query]
 
         if thread_id is not None:
             conditions.append("memory_fts.thread_id = ?")
@@ -266,5 +270,17 @@ class HybridRetriever:
         return maybe_rerank(query, ordered, final_top_k=top_k)
 
 
-__all__ = ["HybridRetriever"]
+# 模块级单例：避免每次 node_jean 被路由到都重新跑一遍 PersonaMemory.__init__
+# （里面有全部 CREATE TABLE IF NOT EXISTS DDL，频繁执行纯属浪费）
+_hybrid_retriever: Optional["HybridRetriever"] = None
+
+
+def get_hybrid_retriever(db_path: str = "./data/axiodrasil_core.db") -> "HybridRetriever":
+    global _hybrid_retriever
+    if _hybrid_retriever is None or _hybrid_retriever.db_path != db_path:
+        _hybrid_retriever = HybridRetriever(db_path=db_path)
+    return _hybrid_retriever
+
+
+__all__ = ["HybridRetriever", "get_hybrid_retriever"]
 

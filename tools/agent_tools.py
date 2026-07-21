@@ -1,7 +1,11 @@
 import os
+from pathlib import Path
 
 from langchain_core.tools import tool
 from langchain_experimental.utilities import PythonREPL
+
+# 安全边界固定为项目根目录，不依赖运行时 CWD
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
 @tool
@@ -27,8 +31,8 @@ def execute_python(code: str) -> str:
 def write_local_file(file_path: str, content: str) -> str:
     """将代码或文本写入本地绝对路径或相对路径。调用前必须确保陛下已授权。"""
     try:
-        # 安全限制：只能在当前工作区目录下写入文件
-        base_dir = os.path.abspath(".")
+        # 安全限制：只能在项目根目录下写入文件（不依赖运行时 CWD）
+        base_dir = str(_PROJECT_ROOT)
         target_path = os.path.abspath(file_path)
 
         if not target_path.startswith(base_dir):

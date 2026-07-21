@@ -75,6 +75,12 @@ def build_sft_records(
     system_instruction: str,
     user_prompt_template: str,
 ) -> List[dict]:
+    """将日志文本清洗、分块后构建 SFT 训练记录。
+
+    注意（MVP 占位）：当前 output 与 input 相同（直接复述原文块），适合作为
+    基础知识记忆型 SFT 数据。若要用于指令微调（让模型学会清洗/变换逻辑），
+    需要将 output 替换为经 LLM 清洗/结构化后的产物——这是后续迭代的 TODO。
+    """
     cleaned = _normalize_text(log_text)
     chunks = _split_chunks(cleaned)
     records: List[dict] = []
@@ -88,6 +94,8 @@ def build_sft_records(
                 "system": system_instruction,
                 "instruction": user_prompt_template,
                 "input": chunk,
+                # MVP 占位：output == input，适合知识记忆型 SFT；
+                # 指令微调场景需替换为 LLM 清洗后的结构化输出
                 "output": chunk,
                 "messages": [
                     {"role": "system", "content": system_instruction},

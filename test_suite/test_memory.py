@@ -1,5 +1,6 @@
 # test_memory.py
-from agents.router import MAIN_THREAD_ID, app, memory_db
+from agents.router import MAIN_THREAD_ID, app
+from infrastructure.container import get_memory_db
 
 
 def _print_header():
@@ -32,7 +33,7 @@ def run_memory_test():
     app.invoke({"current_input": input_1})
 
     # 验证数据库物理写入情况
-    q1_tasks = memory_db.get_active_q1(MAIN_THREAD_ID)
+    q1_tasks = get_memory_db().get_active_q1(MAIN_THREAD_ID)
     print("📦 L3 / memory_matrix 当前未完成的 Q1 记录：")
     if not q1_tasks:
         print("   （空）❌ 未检测到 Q1 记忆，请检查 parser 或 quadrant 判定。")
