@@ -4,7 +4,7 @@ This file provides guidance to Lingma (lingma.aliyun.com) when working with code
 
 ## Project Overview
 
-Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure study/project scenarios. It uses LangGraph + Qwen (千问) to route user inputs to specialized agents ("内阁/cabinet"), backed by an L3 memory matrix (SQLite + FTS5 + vector embeddings) and Hybrid RAG retrieval. The frontend is a Next.js chat UI with SSE streaming.
+Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure study/project scenarios. It uses LangGraph + DeepSeek（默认）/ Qwen  to route user inputs to specialized agents ("内阁/cabinet"), backed by an L3 memory matrix (SQLite + FTS5 + vector embeddings) and Hybrid RAG retrieval. Primary interactive front-end for multi-persona play is **SillyTavern Group Chat**; Next.js chat UI remains available.
 
 The system persona is an "imperial cabinet" (BIOS V17.0) with 11 named characters + 1 functional role (Jean), organized in tiers:
 - **Tier 1 (Core)**: Bina (emotion), Bit (tech), Taki (logic audit), Chizheng (strategy)
@@ -21,15 +21,21 @@ The system persona is an "imperial cabinet" (BIOS V17.0) with 11 named character
 
 ### Environment Setup
 ```powershell
-# Create .env in project root with:
-# QWEN_API_KEY=<your key>
+# Create .env in project root (see .env.example) with:
+# AX_LLM_PROVIDER=deepseek
+# DEEPSEEK_API_KEY=<your key>
+# AX_CHAT_MODEL=deepseek-v4-flash
+# QWEN_API_KEY=<for embeddings>
 # QWEN_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 # REDIS_URL=redis://localhost:6379/0
 # Optional: JINA_API_KEY, RERANK_PROVIDER, RERANK_MODEL, RERANK_API_URL, RERANK_DISABLED
+# Optional: AX_DEEPSEEK_THINKING=0|1
 
 pip install -r requirements.txt
 cd frontend; npm install; cd ..
 ```
+
+SillyTavern Group Chat：见 `docs/SillyTavern_Integration.md`；角色卡在 `sillytavern/character_card/group/`。
 
 ### Starting the Dev Stack
 Use the PowerShell orchestrator (recommended):
@@ -98,21 +104,25 @@ User Input → FastAPI (main.py) → SessionCache (Redis, 5-turn sliding window)
 
 **Persona resolution priority** (in `_resolve_route`):
 1. Medical hard break (pain_level > 6) → bina
-2. Summon protocol (`传 [Name]` regex) → mapped persona
-3. Cleaning keywords → bit
-4. Debate detection (indulgence + conflict keywords) → debate_agent
-5. Late-night + work keywords → fukucho
-6. Fatigue keywords → qianjin
-7. Shopping/Art/Math/Taki/Boming/Politics keyword tables
-8. Domain defaults via `DOMAIN_DEFAULT_PERSONA`
-9. Diversity patch (Q3/Q4 only, 15% probability) → random low-frequency persona
+2. Forced persona (SillyTavern Group Chat: `x-persona` / model / `[AX_PERSONA:]`)
+3. Summon protocol (`传 [Name]` regex) → mapped persona
+4. Cleaning keywords → bit
+5. Debate detection (indulgence + conflict keywords) → debate_agent
+6. Late-night + work keywords → fukucho
+7. Fatigue keywords → qianjin
+8. Shopping/Art/Math/Taki/Boming/Politics keyword tables
+9. Domain defaults via `DOMAIN_DEFAULT_PERSONA`
+10. Diversity patch (Q3/Q4 only, 15% probability) → random low-frequency persona
 
-**Memory architecture is 4-tier**:
+**Memory architecture is 4-tier storage + cabinet M1/M2/M3**:
 - **L1**: Redis session cache — 5-turn sliding window, 1h TTL (`memory/session_cache.py`); SQLite `chat_turns` cold history for history/export and Redis fallback (`main.py` `_persist_turn`)
 - **L2**: Rolling summaries — mid-term, generated every 20 turns by async task; **injected** into parser + persona prompts via `memory/context_inject.py`
 - **L3**: Memory matrix — SQLite with FTS5 + 1536-dim vector BLOBs + entity tables (`memory/database.py`); online `embed_and_store_memory` after Q1/Q2 save
+- **Cabinet M1/M2/M3** (`memory/cabinet_layers.py`): shared debate buffer / persona-private fragments / consensus after `散会` or `POST /api/v1/cabinet/consensus`
 - **Enrichment pipeline**: Q1/Q2 memories trigger async `extract_and_store` → fragments (fact/preference/emotion) + entity registration; preference/fact fragments injected on emotion/闲聊 paths (Bina/Tianji/Fukucho/Qianjin)
 - **Interaction hooks**: MoodEngine `arm_interaction_hook` before `tick` — reunion (>2h) / daily-first greetings (`AX_INTERACTION_HOOKS_ENABLED`)
+- **LLM**: default DeepSeek `deepseek-v4-flash` (`AX_LLM_PROVIDER=deepseek`); embeddings still DashScope via `QWEN_API_KEY`
+- **SillyTavern Group Chat**: force persona via `x-persona` / `axiodrasil-<id>` model / `[AX_PERSONA:id]`; see `docs/SillyTavern_Integration.md`
 
 **Hybrid RAG** (`hybrid_engine.py`): 3-way recall (FTS5 BM25 + cosine vector + entity string match) → RRF fusion → optional external rerank (Jina/SiliconFlow). Used primarily by Jean node for Q2 document retrieval.
 
@@ -129,8 +139,9 @@ User Input → FastAPI (main.py) → SessionCache (Redis, 5-turn sliding window)
 | POST | `/api/v1/chat/export` | Export session to `output/chats/*.jsonl` |
 | GET | `/api/v1/chat/history` | Get recent turns for session |
 | GET | `/api/v1/health` | Health probe (no LLM call) |
-| GET | `/v1/models` | OpenAI-compat model list (for SillyTavern) |
-| POST | `/v1/chat/completions` | OpenAI-compat chat (for SillyTavern) |
+| POST | `/api/v1/cabinet/consensus` | Compress M1 debate → M3 consensus |
+| GET | `/v1/models` | OpenAI-compat model list (cabinet + 12 personas) |
+| POST | `/v1/chat/completions` | OpenAI-compat chat (SillyTavern Group Chat) |
 
 Session identity: `x-session-id` header (primary), or derived from auth key / user field.
 

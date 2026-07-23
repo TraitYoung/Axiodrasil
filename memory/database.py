@@ -220,6 +220,73 @@ class PersonaMemory:
                 """
             )
 
+            # 10) 人设私忆：fragments.persona 列（空字符串 = 旧共享碎片 / 共识侧）
+            frag_cols = {
+                row[1] for row in conn.execute("PRAGMA table_info(memory_fragments)").fetchall()
+            }
+            if "persona" not in frag_cols:
+                conn.execute(
+                    "ALTER TABLE memory_fragments ADD COLUMN persona TEXT NOT NULL DEFAULT ''"
+                )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_fragments_thread_persona
+                ON memory_fragments (thread_id, persona, fragment_type)
+                """
+            )
+
+            # 11) 内阁吵架层（M1）状态 + 轮次
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cabinet_debate_state (
+                    thread_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL DEFAULT 'closed', -- open / closed
+                    opened_at TIMESTAMP,
+                    closed_at TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cabinet_debate_turns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT NOT NULL,
+                    speaker TEXT NOT NULL,
+                    role TEXT NOT NULL, -- user | assistant
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_debate_turns_thread
+                ON cabinet_debate_turns (thread_id, id)
+                """
+            )
+
+            # 12) 内阁共识层（M3）
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cabinet_consensus (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    thread_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    conclusions TEXT NOT NULL DEFAULT '',
+                    unresolved TEXT NOT NULL DEFAULT '',
+                    action_items TEXT NOT NULL DEFAULT '',
+                    source_turn_count INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_consensus_thread
+                ON cabinet_consensus (thread_id, created_at)
+                """
+            )
+
             conn.commit()
 
     # ==================== L3 原始记忆矩阵 ====================
@@ -345,15 +412,17 @@ class PersonaMemory:
         content: str,
         fragment_type: str,
         source_memory_id: Optional[int] = None,
+        persona: str = "",
     ) -> int:
         stored_content = self._encrypt(content)
         with sqlite3.connect(self.db_path) as conn:
             cur = conn.execute(
                 """
-                INSERT INTO memory_fragments (thread_id, source_memory_id, fragment_type, content)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO memory_fragments
+                    (thread_id, source_memory_id, fragment_type, content, persona)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (thread_id, source_memory_id, fragment_type, stored_content),
+                (thread_id, source_memory_id, fragment_type, stored_content, persona or ""),
             )
             conn.commit()
             return int(cur.lastrowid)
@@ -370,12 +439,31 @@ class PersonaMemory:
             )
             conn.commit()
 
-    def get_fragments(self, thread_id: str, fragment_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
-        sql = "SELECT id, fragment_type, content, created_at FROM memory_fragments WHERE thread_id = ?"
+    def get_fragments(
+        self,
+        thread_id: str,
+        fragment_type: Optional[str] = None,
+        limit: int = 50,
+        *,
+        persona: Optional[str] = None,
+        shared_only: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """persona=None 且 shared_only=False：返回该 thread 全部碎片（兼容旧行为）。
+        persona='bina'：仅该人设私忆；shared_only=True：仅 persona='' 的共享碎片。
+        """
+        sql = (
+            "SELECT id, fragment_type, content, created_at, persona "
+            "FROM memory_fragments WHERE thread_id = ?"
+        )
         params: List[Any] = [thread_id]
         if fragment_type:
             sql += " AND fragment_type = ?"
             params.append(fragment_type)
+        if shared_only:
+            sql += " AND (persona IS NULL OR persona = '')"
+        elif persona is not None:
+            sql += " AND persona = ?"
+            params.append(persona)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
         with sqlite3.connect(self.db_path) as conn:
@@ -387,6 +475,145 @@ class PersonaMemory:
                 "fragment_type": row[1],
                 "content": self._decrypt(row[2]),
                 "created_at": row[3],
+                "persona": row[4] or "",
+            }
+            for row in rows
+        ]
+
+    # ==================== 内阁吵架层 M1 ====================
+    def get_debate_status(self, thread_id: str) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT status FROM cabinet_debate_state WHERE thread_id = ?",
+                (thread_id,),
+            ).fetchone()
+        return str(row[0]) if row else "closed"
+
+    def open_debate(self, thread_id: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO cabinet_debate_state (thread_id, status, opened_at, closed_at)
+                VALUES (?, 'open', CURRENT_TIMESTAMP, NULL)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    status = 'open',
+                    opened_at = CURRENT_TIMESTAMP,
+                    closed_at = NULL
+                """,
+                (thread_id,),
+            )
+            conn.commit()
+
+    def close_debate(self, thread_id: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO cabinet_debate_state (thread_id, status, closed_at)
+                VALUES (?, 'closed', CURRENT_TIMESTAMP)
+                ON CONFLICT(thread_id) DO UPDATE SET
+                    status = 'closed',
+                    closed_at = CURRENT_TIMESTAMP
+                """,
+                (thread_id,),
+            )
+            conn.commit()
+
+    def append_debate_turn(
+        self, thread_id: str, speaker: str, role: str, content: str
+    ) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO cabinet_debate_turns (thread_id, speaker, role, content)
+                VALUES (?, ?, ?, ?)
+                """,
+                (thread_id, speaker, role, content),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def get_debate_turns(self, thread_id: str, limit: int = 30) -> List[Dict[str, str]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT speaker, role, content, created_at
+                FROM cabinet_debate_turns
+                WHERE thread_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (thread_id, max(limit, 1)),
+            ).fetchall()
+        turns: List[Dict[str, str]] = []
+        for speaker, role, content, created_at in reversed(rows):
+            turns.append(
+                {
+                    "speaker": str(speaker or ""),
+                    "role": str(role or ""),
+                    "content": str(content or ""),
+                    "ts": str(created_at or ""),
+                }
+            )
+        return turns
+
+    def clear_debate_turns(self, thread_id: str) -> None:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "DELETE FROM cabinet_debate_turns WHERE thread_id = ?",
+                (thread_id,),
+            )
+            conn.commit()
+
+    # ==================== 内阁共识层 M3 ====================
+    def save_consensus(
+        self,
+        thread_id: str,
+        summary: str,
+        conclusions: str = "",
+        unresolved: str = "",
+        action_items: str = "",
+        source_turn_count: int = 0,
+    ) -> int:
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO cabinet_consensus
+                    (thread_id, summary, conclusions, unresolved, action_items, source_turn_count)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    thread_id,
+                    summary,
+                    conclusions,
+                    unresolved,
+                    action_items,
+                    source_turn_count,
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid)
+
+    def get_recent_consensus(self, thread_id: str, limit: int = 3) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                """
+                SELECT summary, conclusions, unresolved, action_items,
+                       source_turn_count, created_at
+                FROM cabinet_consensus
+                WHERE thread_id = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (thread_id, limit),
+            ).fetchall()
+        return [
+            {
+                "summary": row[0],
+                "conclusions": row[1],
+                "unresolved": row[2],
+                "action_items": row[3],
+                "source_turn_count": row[4],
+                "created_at": row[5],
             }
             for row in rows
         ]

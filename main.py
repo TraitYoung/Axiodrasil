@@ -11,9 +11,17 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
+from agents.persona_meta import PERSONA_META, PERSONA_TO_ROUTE, SUMMON_ALIASES
 from agents.router import app as router_graph
 from agents.workflow_pipelines import run_dev_pipeline, synthetic_intent_for_workflow
-from infrastructure.container import get_llm, get_memory_db
+from infrastructure.container import get_chat_model, get_llm, get_llm_provider, get_memory_db
+from memory import async_tasks
+from memory.cabinet_layers import (
+    append_debate_exchange,
+    close_and_compress,
+    detect_consensus_close,
+    extract_persona_private,
+)
 from memory.session_cache import SessionCache
 from memory.summary_service import maybe_trigger_rolling_summary
 from schemas.protocols import TaskIntent
@@ -23,6 +31,55 @@ from tracing.router_run import run_router_traced
 app = FastAPI(title="Axiodrasil Core API", version="1.0.0")
 
 session_cache = SessionCache(ttl_seconds=3600, window_size=5)
+
+_AX_PERSONA_TAG_RE = re.compile(r"\[AX_PERSONA:([a-zA-Z]+)\]", re.IGNORECASE)
+_MODEL_PERSONA_RE = re.compile(
+    r"^(?:axiodrasil[-_])?([a-zA-Z]+)$", re.IGNORECASE
+)
+
+
+def _normalize_persona(token: Optional[str]) -> Optional[str]:
+    if not token or not str(token).strip():
+        return None
+    raw = str(token).strip()
+    mapped = SUMMON_ALIASES.get(raw) or SUMMON_ALIASES.get(raw.lower())
+    if mapped and mapped in PERSONA_TO_ROUTE:
+        return mapped
+    return None
+
+
+def _persona_from_model(model: str) -> Optional[str]:
+    if not model:
+        return None
+    m = _MODEL_PERSONA_RE.match(model.strip())
+    if not m:
+        return None
+    return _normalize_persona(m.group(1))
+
+
+def _persona_from_messages(messages: list) -> Optional[str]:
+    for msg in messages:
+        content = getattr(msg, "content", None) or ""
+        hit = _AX_PERSONA_TAG_RE.search(content)
+        if hit:
+            found = _normalize_persona(hit.group(1))
+            if found:
+                return found
+    return None
+
+
+def _resolve_forced_persona(
+    *,
+    x_persona: Optional[str],
+    model: Optional[str],
+    messages: Optional[list],
+) -> Optional[str]:
+    """优先级：x-persona 头 > model id > messages 内 [AX_PERSONA:id]。"""
+    return (
+        _normalize_persona(x_persona)
+        or _persona_from_model(model or "")
+        or _persona_from_messages(messages or [])
+    )
 
 
 def _load_recent_history(session_id: str, limit: int = 5) -> list[str]:
@@ -78,7 +135,12 @@ def api_health():
         redis_ok = True
     except Exception:
         pass
-    return {"ok": True, "redis": redis_ok}
+    return {
+        "ok": True,
+        "redis": redis_ok,
+        "llm_provider": get_llm_provider(),
+        "chat_model": get_chat_model(),
+    }
 
 
 WorkflowMode = Literal["default", "dev_pipeline"]
@@ -89,6 +151,14 @@ class ChatRequest(BaseModel):
     workflow_mode: WorkflowMode = Field(
         default="default",
         description="default=内阁路由；dev_pipeline=AI 赋能软件工程（敏捷取向）多步流水线",
+    )
+    forced_persona: Optional[str] = Field(
+        default=None,
+        description="强制本轮说话人设（酒馆 Group Chat）；仍受 pain_level>6 医疗熔断约束",
+    )
+    strip_persona_prefix: bool = Field(
+        default=False,
+        description="True 时对外回复去掉 [persona]: 前缀（Group Chat 气泡已有角色名）",
     )
 
 
@@ -120,11 +190,10 @@ class ChatHistoryResponse(BaseModel):
 
 def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskIntent, list, str, str]:
     """
-    执行一轮对话或工作流。返回 (带前缀的 reply, intent, trace_raw, active_task_type, active_persona)。
+    执行一轮对话或工作流。返回 (reply, intent, trace_raw, active_task_type, active_persona)。
 
-    p3-avatar-switch-decision：reply 前缀沿用 `[xxx]:` 格式，但前缀内容改为
-    persona 名字（更细粒度），SillyTavern 侧的自定义扩展
-    （sillytavern/extensions/persona-avatar-switch）会解析这个前缀来切头像/表情。
+    默认 reply 带 `[persona]:` 前缀；`strip_persona_prefix=True`（Group Chat）时对外去前缀，
+    调用方应用带前缀文本写回记忆。
     """
     if payload.workflow_mode == "dev_pipeline":
         reply_raw, trace_raw = run_dev_pipeline(payload.text, get_llm())
@@ -138,6 +207,9 @@ def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskInten
             "thread_id": session_id,
             "recent_history": recent_history,
         }
+        forced = _normalize_persona(payload.forced_persona)
+        if forced:
+            graph_state["forced_persona"] = forced
         result, trace_raw = run_router_traced(router_graph, graph_state)
         reply_raw = str(result.get("final_response", ""))
         intent = result.get("intent")
@@ -148,7 +220,6 @@ def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskInten
             active_task_type = getattr(intent, "task_type", None)
         active_persona = result.get("active_persona") or getattr(intent, "persona", None)
 
-    # 兼容旧的 domain 级前缀映射：新增人格没有命中时兜底走这张表
     prefix_map = {
         "emotion": "bina",
         "jean": "jean",
@@ -159,8 +230,59 @@ def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskInten
     }
     prefix = str(active_persona) if active_persona else prefix_map.get(str(active_task_type), "juzheng")
     reply_clean = re.sub(r"^\s*\[[^\]]+]\s*[:：]\s*", "", str(reply_raw))
-    reply = f"[{prefix}]: {reply_clean}"
-    return reply, intent, trace_raw, str(active_task_type), str(active_persona or prefix)
+    reply_labeled = f"[{prefix}]: {reply_clean}"
+    reply_out = reply_clean if payload.strip_persona_prefix else reply_labeled
+    return reply_out, intent, trace_raw, str(active_task_type), str(active_persona or prefix)
+
+
+def _after_turn_memory(
+    session_id: str,
+    user_text: str,
+    reply_for_client: str,
+    active_persona: str,
+    *,
+    group_mode: bool,
+) -> str:
+    """写回 L1、可选 M1/M2，并在散会口令时压缩进 M3。返回可能带前缀的持久化文本。"""
+    labeled = reply_for_client
+    if not re.match(r"^\s*\[[^\]]+]\s*[:：]", reply_for_client or ""):
+        labeled = f"[{active_persona}]: {reply_for_client}"
+
+    _persist_turn(session_id, user_text, labeled)
+    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
+
+    if group_mode and active_persona:
+        try:
+            append_debate_exchange(
+                session_id,
+                user_text=user_text,
+                assistant_text=re.sub(
+                    r"^\s*\[[^\]]+]\s*[:：]\s*", "", labeled
+                ),
+                persona=active_persona,
+            )
+        except Exception as e:
+            print(f"⚠️ [cabinet] M1 写回失败: {e}")
+        try:
+            async_tasks.schedule(
+                extract_persona_private,
+                session_id,
+                active_persona,
+                user_text=user_text,
+                assistant_text=re.sub(r"^\s*\[[^\]]+]\s*[:：]\s*", "", labeled),
+            )
+        except Exception as e:
+            print(f"⚠️ [cabinet] M2 私忆调度失败: {e}")
+
+    if detect_consensus_close(user_text) or detect_consensus_close(reply_for_client):
+        try:
+            summary = close_and_compress(session_id)
+            if summary:
+                print(f"📜 [cabinet] 已散会并写入共识: {summary[:80]}...")
+        except Exception as e:
+            print(f"⚠️ [cabinet] 共识压缩失败: {e}")
+
+    return labeled
 
 
 @app.post("/api/v1/chat", response_model=ChatResponse)
@@ -181,9 +303,13 @@ async def chat_api(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    # 每次回复后双写 Redis + SQLite，会话热窗 TTL 维持 1 小时
-    _persist_turn(session_id, payload.text, reply)
-    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
+    _after_turn_memory(
+        session_id,
+        payload.text,
+        reply,
+        active_persona,
+        group_mode=bool(payload.forced_persona),
+    )
 
     trace = [TraceStep.model_validate(s) for s in trace_raw]
     return ChatResponse(
@@ -217,9 +343,13 @@ async def chat_stream_api(
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    # 每次回复后双写 Redis + SQLite
-    _persist_turn(session_id, payload.text, reply)
-    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
+    _after_turn_memory(
+        session_id,
+        payload.text,
+        reply,
+        active_persona,
+        group_mode=bool(payload.forced_persona),
+    )
 
     trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
 
@@ -327,13 +457,12 @@ async def chat_history_api(x_session_id: str | None = Header(default=None), limi
 
 
 # ==========================================================
-# Phase 3: OpenAI 兼容适配层（供 SillyTavern 等前端接入）
+# Phase 3: OpenAI 兼容适配层（供 SillyTavern Group Chat 接入）
 # ==========================================================
-# 详见 docs/SillyTavern_Integration.md。这一层只做协议转换，直接复用
-# `_execute_turn`（内部走同一套 LangGraph 路由/记忆/状态引擎），不引入任何
-# 额外的 LLM 调用，性能开销可忽略。
+# 详见 docs/SillyTavern_Integration.md。
 
 AXIODRASIL_MODEL_ID = "axiodrasil-cabinet"
+CABINET_PERSONA_IDS = list(PERSONA_META.keys())
 
 
 class OpenAIChatMessage(BaseModel):
@@ -345,24 +474,17 @@ class OpenAIChatCompletionRequest(BaseModel):
     model: str = AXIODRASIL_MODEL_ID
     messages: List[OpenAIChatMessage]
     stream: bool = False
-    # 部分 OpenAI 兼容客户端会把稳定的用户标识放在这个字段；
-    # 内阁把它当作 session 映射的第三优先级来源（见下方 _resolve_session_id）。
     user: Optional[str] = None
 
 
 def _resolve_session_id(x_session_id: Optional[str], authorization: Optional[str], user_field: Optional[str]) -> str:
-    """p3-session-mapping：把酒馆的会话身份映射到内阁的 thread_id/x-session-id。
+    """把酒馆的会话身份映射到内阁的 thread_id/x-session-id。
 
     优先级：
-    1. `x-session-id` 自定义请求头——推荐方式。SillyTavern 的 "Custom
-       (OpenAI-compatible)" 连接支持在连接配置里添加 Additional Headers，
-       把这个头固定写成某个稳定值（比如角色卡名或随便一个 UUID），就能让
-       每次请求都落到同一个内阁会话/记忆空间。
-    2. `Authorization` 头里的 API Key——如果没配自定义头，用 Key 做稳定映射
-       （同一个 Key 的酒馆连接，每次算出来的 session_id 一致）。
-    3. OpenAI 请求体里的 `user` 字段（如果客户端有填）。
-    4. 都没有时兜底一个固定会话（单用户本地部署可用，但多设备/多角色卡会
-       共享同一份记忆，不推荐长期这样用）。
+    1. `x-session-id` 自定义请求头（Group Chat 强烈建议固定同一值）
+    2. `Authorization` 头里的 API Key
+    3. OpenAI 请求体里的 `user` 字段
+    4. 兜底 `sillytavern-default`
     """
     if x_session_id and x_session_id.strip():
         return x_session_id.strip()
@@ -376,17 +498,42 @@ def _resolve_session_id(x_session_id: Optional[str], authorization: Optional[str
 
 @app.get("/v1/models")
 async def openai_compat_models():
-    """SillyTavern 在切换到 Custom (OpenAI-compatible) 连接时会先拉一次模型列表。"""
-    return {
-        "object": "list",
-        "data": [
+    """SillyTavern：返回内阁总模型 + 12 个人设模型（便于 Group 成员各自绑定）。"""
+    data = [
+        {
+            "id": AXIODRASIL_MODEL_ID,
+            "object": "model",
+            "created": 0,
+            "owned_by": "axiodrasil",
+        }
+    ]
+    for pid in CABINET_PERSONA_IDS:
+        data.append(
             {
-                "id": AXIODRASIL_MODEL_ID,
+                "id": f"axiodrasil-{pid}",
                 "object": "model",
                 "created": 0,
                 "owned_by": "axiodrasil",
             }
-        ],
+        )
+    return {"object": "list", "data": data}
+
+
+@app.post("/api/v1/cabinet/consensus")
+async def cabinet_consensus_api(x_session_id: str | None = Header(default=None)):
+    """显式散会：压缩 M1 吵架层 → M3 共识层。"""
+    if not x_session_id or not x_session_id.strip():
+        raise HTTPException(status_code=400, detail="missing x-session-id header")
+    session_id = x_session_id.strip()
+    try:
+        summary = close_and_compress(session_id)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"consensus failed: {exc}") from exc
+    return {
+        "session_id": session_id,
+        "ok": True,
+        "summary": summary or "",
+        "message": "已散会并写入共识" if summary else "无进行中的吵架缓冲，已关闭吵架状态",
     }
 
 
@@ -395,12 +542,10 @@ async def openai_compat_chat_completions(
     payload: OpenAIChatCompletionRequest,
     x_session_id: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
+    x_persona: str | None = Header(default=None),
 ):
     session_id = _resolve_session_id(x_session_id, authorization, payload.user)
 
-    # 只取最后一条 user 消息作为本轮输入：内阁有自己的 Redis 滑窗 + L3 记忆 +
-    # 滚动摘要（Phase 1），不需要（也不应该）把酒馆自带的历史消息数组重新塞
-    # 一遍，否则等于两套记忆机制打架。
     user_text = ""
     for msg in reversed(payload.messages):
         if msg.role == "user" and msg.content.strip():
@@ -409,21 +554,38 @@ async def openai_compat_chat_completions(
     if not user_text:
         raise HTTPException(status_code=400, detail="no user message found in messages[]")
 
-    chat_payload = ChatRequest(text=user_text)
+    forced = _resolve_forced_persona(
+        x_persona=x_persona,
+        model=payload.model,
+        messages=payload.messages,
+    )
+    # Group Chat：有强制人设时去前缀；无强制时保持旧单卡前缀行为
+    group_mode = forced is not None
+    chat_payload = ChatRequest(
+        text=user_text,
+        forced_persona=forced,
+        strip_persona_prefix=group_mode,
+    )
     try:
-        reply, _intent, _trace_raw, _active, _active_persona = _execute_turn(chat_payload, session_id)
+        reply, _intent, _trace_raw, _active, active_persona = _execute_turn(
+            chat_payload, session_id
+        )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    _persist_turn(session_id, user_text, reply)
-    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
+    _after_turn_memory(
+        session_id,
+        user_text,
+        reply,
+        active_persona,
+        group_mode=group_mode,
+    )
 
     created_ts = int(datetime.now(timezone.utc).timestamp())
     completion_id = f"chatcmpl-{uuid4().hex[:24]}"
 
-    # 粗估 token 数（4 字符 ≈ 1 token），让客户端的 token 统计不全是 0
     est_prompt_tokens = max(1, len(user_text) // 4)
     est_completion_tokens = max(1, len(reply) // 4)
 

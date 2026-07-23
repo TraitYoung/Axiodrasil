@@ -73,13 +73,30 @@ def _maybe_diversity_patch(intent: TaskIntent) -> Optional[str]:
     return random.choice(_DIVERSITY_CANDIDATES)
 
 
-def resolve_route(intent: TaskIntent, current_input: str, now: datetime) -> tuple[str, str]:
-    """一次性算出 (persona, route_key)。只应该在 node_parser 里被调用一次。"""
+def resolve_route(
+    intent: TaskIntent,
+    current_input: str,
+    now: datetime,
+    *,
+    forced_persona: Optional[str] = None,
+) -> tuple[str, str]:
+    """一次性算出 (persona, route_key)。只应该在 node_parser 里被调用一次。
+
+    forced_persona：酒馆 Group Chat 指定说话人；仍不能绕过 pain_level > 6 医疗熔断。
+    """
     lower_input = current_input.lower()
 
     # 0. 安全底线：医疗硬熔断
     if intent.pain_level > 6:
         return "bina", "emotion_route"
+
+    # 0.5 酒馆强制人设（跳过关键词/多样性/辩论并行）
+    if forced_persona:
+        persona = SUMMON_ALIASES.get(forced_persona) or SUMMON_ALIASES.get(
+            forced_persona.lower()
+        )
+        if persona and persona in PERSONA_TO_ROUTE:
+            return persona, PERSONA_TO_ROUTE[persona]
 
     # 1. 召唤协议
     summon_persona = match_summon(current_input)

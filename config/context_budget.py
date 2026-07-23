@@ -45,6 +45,12 @@ MAX_AGENT_HISTORY_CHARS = _env_int("AX_AGENT_HISTORY_MAX_CHARS", 2000)
 # 人格节点注入的最近历史轮数上限
 MAX_AGENT_HISTORY_TURNS = _env_int("AX_AGENT_HISTORY_TURNS", 5)
 
+# 内阁三层记忆注入预算
+MAX_DEBATE_INJECT_CHARS = _env_int("AX_DEBATE_INJECT_MAX_CHARS", 2400)
+MAX_CONSENSUS_INJECT_CHARS = _env_int("AX_CONSENSUS_INJECT_MAX_CHARS", 1000)
+MAX_PERSONA_PRIVATE_CHARS = _env_int("AX_PERSONA_PRIVATE_MAX_CHARS", 800)
+MAX_DEBATE_BUFFER_TURNS = _env_int("AX_DEBATE_BUFFER_TURNS", 30)
+
 
 def clip_text(text: str, max_chars: int) -> str:
     if max_chars <= 0 or len(text) <= max_chars:

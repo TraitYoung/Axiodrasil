@@ -29,3 +29,29 @@ class MemoryExtraction(BaseModel):
     entities: List[ExtractedEntity] = Field(
         default_factory=list, description="提到的人物/项目/关键词，不超过 5 个。"
     )
+
+
+class PersonaPrivateExtraction(BaseModel):
+    """从一轮人设发言中提炼的「仅本人可见」私忆。"""
+
+    private_notes: List[str] = Field(
+        default_factory=list,
+        description="该人设对局势/陛下的私有判断或立场，简短，不超过 4 条；没有就留空。",
+    )
+
+
+class ConsensusExtraction(BaseModel):
+    """吵架层压缩进共识层的结构化结果。"""
+
+    conclusions: List[str] = Field(
+        default_factory=list, description="已拍板结论，简短条目，不超过 6 条。"
+    )
+    unresolved: List[str] = Field(
+        default_factory=list, description="仍未决的分歧，简短条目，不超过 4 条。"
+    )
+    action_items: List[str] = Field(
+        default_factory=list, description="共同行动项/承诺，简短条目，不超过 4 条。"
+    )
+    summary: str = Field(
+        default="", description="一两句总述本次争执与结果；没有就留空。"
+    )

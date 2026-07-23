@@ -1,26 +1,14 @@
 /**
- * Axiodrasil Persona Avatar Switch
+ * Axiodrasil Persona Avatar Switch (LEGACY — 单卡「内阁」路线)
  * ---------------------------------
- * p3-avatar-switch-decision 选定方案 2（轻量自定义扩展）的实现。
+ * 酒馆已改为 Group Chat（每人设一张卡，由酒馆调度谁发言），本扩展仅保留给
+ * 旧版单卡「内阁」+ `[persona]:` 前缀头像切换。Group Chat 路径不需要本扩展。
  *
- * 背景：内阁只在酒馆里建了一张「内阁」角色卡（不用 Group Chat 多角色卡路线，
- * 避免牵扯"该谁说话"的控制权）。但每一轮回复的第一段文字是后端 `_execute_turn`
- * 已经生成好的人格前缀，形如 `[bina]: ...`、`[bit]: ...`、`[qianjin]: ...`。
+ * 背景（历史）：内阁曾在酒馆里建一张「内阁」角色卡（不用 Group Chat），
+ * 每一轮回复第一段是后端 `_execute_turn` 生成的人格前缀，形如 `[bina]: ...`。
  * 这个扩展做两件事：
- *   1. 把可见气泡里的 `[xxx]:` 前缀去掉（它是路由元数据，不是人设台词）。
- *   2. 把 Character Expressions 插件（Classification Source = Local）渲染出来
- *      的表情图，从默认的 `characters/内阁/<emotion>.png` 重定向到
- *      `characters/内阁/<persona>/<emotion>.png`，从而在「同一张情绪分类结果」下
- *      展示不同人格自己的表情图集（对应 sillytavern/sprites/<persona>/ 里的素材）。
- *
- * 已知限制 / 请知悉：
- * - 本文件是在没有真实 SillyTavern 运行环境下、基于官方文档与开源源码阅读写出的
- *   「最佳努力」实现，用到的事件名 `CHARACTER_MESSAGE_RENDERED` 与 DOM 选择器
- *   `#expression-image` / `.mes[mesid] .mes_text` 是编写时查证到的公开、稳定接口，
- *   但 ST 版本演进可能会改动内部实现。如果装上之后头像不切换/文本前缀没被吃掉，
- *   请打开浏览器开发者工具，确认这两个选择器在你的版本里是否仍然对应正确的元素，
- *   按需调整下面的常量。
- * - 只处理 11 个 BIOS 人格 + jean 这 12 个已知前缀；未知前缀不做任何改写，原样显示。
+ *   1. 把可见气泡里的 `[xxx]:` 前缀去掉。
+ *   2. 把 Character Expressions 表情图重定向到 `characters/内阁/<persona>/`。
  */
 
 (function () {

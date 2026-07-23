@@ -32,7 +32,7 @@ def extract_and_store(
     """
     extraction_llm = get_enrichment_extraction_llm()
     if extraction_llm is None:
-        print("[enrichment] 未配置 QWEN_API_KEY，跳过细粒度提取。")
+        print("[enrichment] 未配置聊天 LLM API Key，跳过细粒度提取。")
         return
 
     memory_db = PersonaMemory(db_path=db_path)

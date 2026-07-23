@@ -19,6 +19,7 @@ from langgraph.prebuilt import create_react_agent
 from infrastructure.container import get_llm, get_memory_db, get_mood_engine
 from memory import async_tasks, enrichment
 from memory.context_inject import (
+    compose_cabinet_context,
     compose_user_message,
     format_fragments_block,
     format_summaries_block,
@@ -73,6 +74,8 @@ class GraphState(TypedDict):
     # 只做确定性查表，避免多样性补丁的随机数在「实际路由」与「tracing 重放」
     # 两次调用之间抽出不一致的结果。
     resolved_route_key: NotRequired[str]
+    # 酒馆 Group Chat 强制说话人；None/缺省则走完整路由。
+    forced_persona: NotRequired[str]
 
 
 # 2. 通用工具函数 ───────────────────────────────────────────────────
@@ -92,21 +95,30 @@ def _memory_blocks_for_reply(
     thread_id: str,
     *,
     include_fragments: bool = False,
-) -> tuple[str, str]:
-    """人格回复侧：L2 摘要；闲聊/情绪路径额外带偏好事实碎片。"""
+    persona: str = "",
+) -> tuple[str, str, str]:
+    """人格回复侧：L2 摘要 + 可选共享碎片 + 内阁三层（M3→M2→M1）。"""
     memory_db = get_memory_db()
     summary_block = ""
     fragment_block = ""
+    cabinet_block = ""
     try:
         summary_block = format_summaries_block(memory_db, thread_id)
     except Exception as e:
         print(f"⚠️ [memory] 摘要回注失败: {e}")
     if include_fragments:
         try:
-            fragment_block = format_fragments_block(memory_db, thread_id)
+            # 共享碎片（persona 空）；人设私忆走 cabinet M2
+            fragment_block = format_fragments_block(
+                memory_db, thread_id, shared_only=True
+            )
         except Exception as e:
             print(f"⚠️ [memory] 碎片回注失败: {e}")
-    return summary_block, fragment_block
+    try:
+        cabinet_block = compose_cabinet_context(memory_db, thread_id, persona)
+    except Exception as e:
+        print(f"⚠️ [memory] 内阁三层注入失败: {e}")
+    return summary_block, fragment_block, cabinet_block
 
 
 def _simple_agent_reply(
@@ -123,14 +135,15 @@ def _simple_agent_reply(
     统一异常兜底。Bina/Jean/Bit/Chizheng 因为各自有检索/工具链/医疗红线等
     定制逻辑，单独实现，不复用这个通用壳。"""
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
-    summary_block, fragment_block = _memory_blocks_for_reply(
-        thread_id, include_fragments=include_fragments
+    summary_block, fragment_block, cabinet_block = _memory_blocks_for_reply(
+        thread_id, include_fragments=include_fragments, persona=persona
     )
     human = compose_user_message(
         user_status,
         recent_history=state.get("recent_history", []),
         summary_block=summary_block,
         fragment_block=fragment_block,
+        cabinet_block=cabinet_block,
     )
     prompt_with_mood = _persona_prompt(persona, system_prompt, thread_id)
     try:
@@ -214,12 +227,16 @@ def node_parser(state: GraphState):
     # route_by_intent 被多次调用时重复触发随机逻辑。
     real_intent.persona = DOMAIN_DEFAULT_PERSONA.get(real_intent.task_type, "chizheng")
 
-    final_persona, resolved_route_key = _resolve_route(real_intent, user_input, datetime.now())
+    forced = (state.get("forced_persona") or "").strip() or None
+    final_persona, resolved_route_key = _resolve_route(
+        real_intent, user_input, datetime.now(), forced_persona=forced
+    )
     real_intent.persona = final_persona
 
     print(
         f"-> [审计] 大模型解析结果: 任务={real_intent.task_type}, 痛感={real_intent.pain_level}, "
         f"最终人格={final_persona}, 路由={resolved_route_key}"
+        + (f", 强制={forced}" if forced else "")
     )
 
     # 【状态引擎】：先算久别/首交互钩子，再 tick；钩子由后续人格 get_prompt_context 消费。
@@ -310,11 +327,14 @@ def node_jean(state: GraphState):
         "请输出：1) 关键要点；2) 建议的阅读/处理路线。"
     )
 
-    summary_block, _ = _memory_blocks_for_reply(thread_id, include_fragments=False)
+    summary_block, _, cabinet_block = _memory_blocks_for_reply(
+        thread_id, include_fragments=False, persona="jean"
+    )
     human = compose_user_message(
         user_status,
         recent_history=state.get("recent_history", []),
         summary_block=summary_block,
+        cabinet_block=cabinet_block,
     )
     prompt_with_mood = _persona_prompt("jean", JEAN_PROMPT, thread_id)
     try:
@@ -376,7 +396,9 @@ def node_bit(state: GraphState):
 
     try:
         agent = create_react_agent(get_llm(), tools=BIT_TOOLS)
-        summary_block, _ = _memory_blocks_for_reply(thread_id, include_fragments=False)
+        summary_block, _, cabinet_block = _memory_blocks_for_reply(
+            thread_id, include_fragments=False, persona="bit"
+        )
         user_msg = compose_user_message(
             (
                 f"当前任务：{intent.raw_input}\n"
@@ -384,6 +406,7 @@ def node_bit(state: GraphState):
             ),
             recent_history=state.get("recent_history", []),
             summary_block=summary_block,
+            cabinet_block=cabinet_block,
         )
         result = agent.invoke(
             {
@@ -427,7 +450,9 @@ def node_bina(state: GraphState):
         thread_id,
     )
 
-    summary_block, fragment_block = _memory_blocks_for_reply(thread_id, include_fragments=True)
+    summary_block, fragment_block, cabinet_block = _memory_blocks_for_reply(
+        thread_id, include_fragments=True, persona="bina"
+    )
     user_status = compose_user_message(
         (
             f"陛下当前情绪发泄/日常闲聊：{intent.raw_input}\n"
@@ -436,6 +461,7 @@ def node_bina(state: GraphState):
         recent_history=state.get("recent_history", []),
         summary_block=summary_block,
         fragment_block=fragment_block,
+        cabinet_block=cabinet_block,
     )
 
     try:
