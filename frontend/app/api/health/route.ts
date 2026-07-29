@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getBackendBaseUrl } from "@/lib/backend";
+import { getBackendBaseUrl } from "@/infra/backend";
 
 export const runtime = "nodejs";
 

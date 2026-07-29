@@ -4,7 +4,24 @@ This file provides guidance to Lingma (lingma.aliyun.com) when working with code
 
 ## Project Overview
 
-Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure study/project scenarios. It uses LangGraph + DeepSeek（默认）/ Qwen  to route user inputs to specialized agents ("内阁/cabinet"), backed by an L3 memory matrix (SQLite + FTS5 + vector embeddings) and Hybrid RAG retrieval. Primary interactive front-end for multi-persona play is **SillyTavern Group Chat**; Next.js chat UI remains available.
+Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure study/project scenarios. It uses LangGraph + DeepSeek（默认）/ Qwen  to route user inputs to specialized agents ("内阁/cabinet"), backed by an L3 memory matrix (SQLite + FTS5 + vector embeddings) and Hybrid RAG retrieval. Primary interactive front-end is the **Next.js 内阁 UI**（默认群聊 `/group` + 单人 `/solo`）；SillyTavern Group Chat 仍可通过 `/v1` 接入。
+
+### Host + 接口矩阵（模块化）
+
+工程按「主体 Host + 统一接口矩阵 + 功能模块」组织（增量迁移中）：
+
+| 路径 | 职责 |
+|------|------|
+| `app/matrix/` | Port 契约：`HealthPort` / `SessionPort` / `ChatPort` / `PersonaPort` / `CabinetPort` / `TracePort` |
+| `app/registry.py` | 模块注册表；`bootstrap_registry()` 装配默认适配器 |
+| `infra/` | 薄封装 → `infrastructure.container`（LLM / DB / Redis） |
+| `modules/personas/` | 角色卡 catalog（`GET /api/v1/personas`） |
+| `modules/chat_api/` | Chat / Health / Trace 适配外壳 |
+| `modules/cabinet_memory/` | 散会共识适配 |
+| `frontend/src/host` + `matrix` + `modules/*` | 前端壳与群聊/单人/角色卡模块；群聊入口含网页开屏 `SplashGate` |
+| `launcher/` | Windows 桌面启动器（CustomTkinter → PyInstaller exe），调用 `scripts/dev_stack.ps1` |
+
+新能力应经矩阵 Port 接入，避免在 Host 内堆业务。旧演示台移至 `frontend/app/lab`。
 
 The system persona is an "imperial cabinet" (BIOS V17.0) with 11 named characters + 1 functional role (Jean), organized in tiers:
 - **Tier 1 (Core)**: Bina (emotion), Bit (tech), Taki (logic audit), Chizheng (strategy)
@@ -44,6 +61,15 @@ Use the PowerShell orchestrator (recommended):
 .\scripts\dev_stack.ps1 -Action stop -All
 .\scripts\dev_stack.ps1 -Action status -All
 ```
+
+Or the GUI launcher (CustomTkinter；可打包 exe)：
+```powershell
+pip install -r launcher/requirements-launcher.txt
+python -m launcher
+# 打包：
+.\launcher\build_exe.ps1
+```
+打开浏览器后进入 `/group` 会先看到网页开屏（本会话一次）。若找不到项目根，设置 `AX_PROJECT_ROOT` 为仓库根路径。
 
 Or manually in 3 terminals:
 ```powershell
@@ -139,6 +165,8 @@ User Input → FastAPI (main.py) → SessionCache (Redis, 5-turn sliding window)
 | POST | `/api/v1/chat/export` | Export session to `output/chats/*.jsonl` |
 | GET | `/api/v1/chat/history` | Get recent turns for session |
 | GET | `/api/v1/health` | Health probe (no LLM call) |
+| GET | `/api/v1/personas` | Persona / character-card catalog |
+| GET | `/api/v1/personas/{id}` | Single persona card |
 | POST | `/api/v1/cabinet/consensus` | Compress M1 debate → M3 consensus |
 | GET | `/v1/models` | OpenAI-compat model list (cabinet + 12 personas) |
 | POST | `/v1/chat/completions` | OpenAI-compat chat (SillyTavern Group Chat) |

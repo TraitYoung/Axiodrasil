@@ -45,3 +45,8 @@ Thumbs.db
 scripts/inspect_q2.py
 scripts/insert_career_nuke.py
 scripts/clear_Q1.py
+
+# 启动器打包产物 / 本地编排状态
+dist/
+build/
+.devstack/

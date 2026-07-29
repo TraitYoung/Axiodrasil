@@ -1,6 +1,6 @@
 import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
-import { getBackendBaseUrl } from "@/lib/backend";
+import { getBackendBaseUrl } from "@/infra/backend";
 
 export const runtime = "nodejs";
 
@@ -8,7 +8,12 @@ export async function POST(req: NextRequest) {
   const sessionId = req.headers.get("x-session-id") || undefined;
   const traceId = req.headers.get("x-trace-id") || undefined;
 
-  let payload: { text?: string; workflow_mode?: string } = {};
+  let payload: {
+    text?: string;
+    workflow_mode?: string;
+    forced_persona?: string | null;
+    strip_persona_prefix?: boolean;
+  } = {};
   try {
     payload = await req.json();
   } catch {
@@ -19,18 +24,22 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ detail: "missing field: text" }, { status: 400 });
   }
 
-  const backendBody: Record<string, string> = { text: payload.text };
+  const backendBody: Record<string, unknown> = { text: payload.text };
   if (payload.workflow_mode && payload.workflow_mode !== "default") {
     backendBody.workflow_mode = payload.workflow_mode;
   }
+  if (payload.forced_persona) {
+    backendBody.forced_persona = payload.forced_persona;
+  }
+  if (typeof payload.strip_persona_prefix === "boolean") {
+    backendBody.strip_persona_prefix = payload.strip_persona_prefix;
+  }
 
   const backendUrl = `${getBackendBaseUrl()}/api/v1/chat/stream`;
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (sessionId) headers["x-session-id"] = sessionId;
   if (traceId) headers["x-trace-id"] = traceId;
+  if (payload.forced_persona) headers["x-persona"] = String(payload.forced_persona);
 
   let backendRes: Response;
   try {
@@ -44,7 +53,7 @@ export async function POST(req: NextRequest) {
     const msg = e instanceof Error ? e.message : String(e);
     return NextResponse.json(
       { detail: `无法连接 FastAPI（${backendUrl}）：${msg}` },
-      { status: 503 }
+      { status: 503 },
     );
   }
 
@@ -52,7 +61,7 @@ export async function POST(req: NextRequest) {
     const text = await backendRes.text().catch(() => "");
     return NextResponse.json(
       { detail: "backend request failed", status: backendRes.status, text },
-      { status: 500 }
+      { status: 500 },
     );
   }
 
@@ -64,10 +73,8 @@ export async function POST(req: NextRequest) {
   const backendTrace = backendRes.headers.get("x-trace-id");
   if (backendTrace) outHeaders["x-trace-id"] = backendTrace;
 
-  // 直接透传 SSE 流：让浏览器接收 data: ...\n\n 事件
   return new Response(backendRes.body, {
     status: backendRes.status,
     headers: outHeaders,
   });
 }
-

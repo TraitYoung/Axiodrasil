@@ -32,6 +32,17 @@ app = FastAPI(title="Axiodrasil Core API", version="1.0.0")
 
 session_cache = SessionCache(ttl_seconds=3600, window_size=5)
 
+# Host 接口矩阵：装配适配器并挂载功能模块路由（personas catalog 等）
+try:
+    from app.registry import bootstrap_registry, get_registry
+    from modules.personas.routes import router as personas_router
+
+    bootstrap_registry()
+    app.state.matrix = get_registry()  # type: ignore[attr-defined]
+    app.include_router(personas_router)
+except Exception as _matrix_exc:  # pragma: no cover
+    print(f"⚠️ [host] 接口矩阵装配失败: {_matrix_exc}")
+
 _AX_PERSONA_TAG_RE = re.compile(r"\[AX_PERSONA:([a-zA-Z]+)\]", re.IGNORECASE)
 _MODEL_PERSONA_RE = re.compile(
     r"^(?:axiodrasil[-_])?([a-zA-Z]+)$", re.IGNORECASE

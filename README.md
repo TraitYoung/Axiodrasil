@@ -29,7 +29,20 @@ Axiodrasil 是一个面向高压学习/项目场景的 **数字助理团** 系�
 
 ## 快速开始（先看这个）
 
-### 手动启动（推荐：三个终端，可见报错、端口清晰）
+### GUI 启动器（推荐：一键启停）
+
+需已安装 Python、Node.js，以及本机可运行的 `redis-server`。
+
+```powershell
+cd <仓库根>
+pip install -r launcher/requirements-launcher.txt
+python -m launcher
+```
+
+在窗口中点「启动全部」，状态灯变绿后会自动打开 `http://127.0.0.1:3000`。群聊页 `/group` 首次进入有网页开屏。  
+打包 exe：`.\launcher\build_exe.ps1` → `dist/AxiodrasilLauncher/`。若双击 exe 找不到项目根，设置环境变量 `AX_PROJECT_ROOT` 指向仓库根。
+
+### 手动启动（三个终端，可见报错、端口清晰）
 
 在项目根目录（本仓库根，含 `main.py` 的那一层）与 `frontend/` 分别操作。
 

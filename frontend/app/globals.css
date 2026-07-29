@@ -1,26 +1,297 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --ax-bg0: #1a1510;
+  --ax-bg1: #241c14;
+  --ax-panel: rgba(42, 32, 24, 0.72);
+  --ax-fg: #f3ebe0;
+  --ax-muted: #a89885;
+  --ax-line: rgba(196, 168, 130, 0.22);
+  --ax-accent: #c4a882;
+  --ax-accent-fg: #1a1510;
+  --ax-user: #3d5a4c;
+  --background: var(--ax-bg0);
+  --foreground: var(--ax-fg);
+  --font-display: var(--font-cormorant), "Times New Roman", serif;
+  --font-body: var(--font-source-sans), "Segoe UI", sans-serif;
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --font-sans: var(--font-body);
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+body {
+  min-height: 100%;
+  color: var(--ax-fg);
+  font-family: var(--font-body);
+  background:
+    radial-gradient(ellipse 80% 50% at 10% -10%, rgba(196, 168, 130, 0.18), transparent 55%),
+    radial-gradient(ellipse 60% 40% at 90% 0%, rgba(90, 60, 40, 0.35), transparent 50%),
+    linear-gradient(165deg, var(--ax-bg0), var(--ax-bg1) 45%, #120e0a);
+}
+
+.ax-header {
+  background: rgba(26, 21, 16, 0.82);
+}
+
+.ax-brand {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  text-decoration: none;
+}
+
+.ax-brand-mark {
+  font-family: var(--font-display);
+  font-size: 1.35rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--ax-accent);
+}
+
+.ax-brand-sub {
+  font-size: 0.75rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--ax-muted);
+}
+
+.ax-chat-panel,
+.ax-roster {
+  border: 1px solid var(--ax-line);
+  border-radius: 1rem;
+  background: var(--ax-panel);
+  backdrop-filter: blur(10px);
+  padding: 0.75rem;
+}
+
+.ax-bubble-user {
+  border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
+  background: linear-gradient(145deg, #4a6b5a, var(--ax-user));
+  color: #f5faf7;
+}
+
+.ax-bubble-assistant {
+  border-radius: 1.1rem 1.1rem 1.1rem 0.35rem;
+  border: 1px solid var(--ax-line);
+  border-left-width: 3px;
+  background: rgba(20, 16, 12, 0.55);
+}
+
+.ax-input {
+  border: 1px solid var(--ax-line);
+  border-radius: 0.85rem;
+  background: rgba(12, 10, 8, 0.55);
+  color: var(--ax-fg);
+  padding: 0.75rem 0.9rem;
+  outline: none;
+}
+
+.ax-input:focus {
+  border-color: var(--ax-accent);
+  box-shadow: 0 0 0 2px rgba(196, 168, 130, 0.2);
+}
+
+.ax-btn-primary {
+  border-radius: 999px;
+  background: var(--ax-accent);
+  color: var(--ax-accent-fg);
+  font-weight: 600;
+  padding: 0.5rem 1.1rem;
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.ax-btn-primary:hover:not(:disabled) {
+  transform: translateY(-1px);
+}
+
+.ax-btn-primary:disabled,
+.ax-btn-ghost:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.ax-btn-ghost {
+  border-radius: 999px;
+  border: 1px solid var(--ax-line);
+  color: var(--ax-fg);
+  padding: 0.4rem 0.9rem;
+  font-size: 0.875rem;
+  transition: background 0.15s ease;
+}
+
+.ax-btn-ghost:hover:not(:disabled) {
+  background: rgba(196, 168, 130, 0.12);
+}
+
+.ax-card-tile {
+  border: 1px solid var(--ax-line);
+  border-radius: 0.85rem;
+  background: rgba(12, 10, 8, 0.35);
+  padding: 0.75rem;
+}
+
+.ax-drawer {
+  background: linear-gradient(180deg, #2a2018, #1a1510);
+  border-left: 1px solid var(--ax-line);
+  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.4);
+}
+
+.ax-typing::after {
+  content: "";
+  animation: ax-blink 1s steps(2, end) infinite;
+}
+
+@keyframes ax-blink {
+  50% {
+    content: "·";
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+.ax-empty {
+  animation: ax-fade-in 0.5s ease both;
+}
+
+@keyframes ax-fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.ax-stage {
+  animation: ax-fade-in 0.35s ease both;
+}
+
+/* ── 网页开屏（群聊入口，本会话一次）───────────────── */
+.ax-splash-boot {
+  min-height: 100vh;
+  background: var(--ax-bg0);
+}
+
+.ax-splash {
+  position: relative;
+  display: flex;
+  min-height: 100vh;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.85rem;
+  padding: 2rem;
+  overflow: hidden;
+  text-align: center;
+  background:
+    radial-gradient(ellipse 70% 45% at 50% 20%, rgba(196, 168, 130, 0.22), transparent 60%),
+    linear-gradient(165deg, #120e0a, var(--ax-bg0) 40%, #1a1510);
+  animation: ax-splash-in 0.55s ease both;
+}
+
+.ax-splash--leave {
+  animation: ax-splash-out 0.38s ease both;
+  pointer-events: none;
+}
+
+.ax-splash-glow {
+  position: absolute;
+  inset: 20% 30%;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(196, 168, 130, 0.18), transparent 70%);
+  filter: blur(28px);
+  pointer-events: none;
+  animation: ax-splash-pulse 3.2s ease-in-out infinite;
+}
+
+.ax-splash-eyebrow {
+  position: relative;
+  font-size: 0.7rem;
+  letter-spacing: 0.35em;
+  text-transform: uppercase;
+  color: var(--ax-muted);
+  animation: ax-fade-in 0.6s ease 0.1s both;
+}
+
+.ax-splash-brand {
+  position: relative;
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: clamp(2.8rem, 8vw, 4.5rem);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  color: var(--ax-accent);
+  animation: ax-splash-brand 0.7s ease 0.15s both;
+}
+
+.ax-splash-tagline {
+  position: relative;
+  max-width: 22rem;
+  margin: 0;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: var(--ax-muted);
+  animation: ax-fade-in 0.6s ease 0.35s both;
+}
+
+.ax-splash-cta {
+  position: relative;
+  margin-top: 1.25rem;
+  border-radius: 999px;
+  background: var(--ax-accent);
+  color: var(--ax-accent-fg);
+  font-weight: 600;
+  padding: 0.65rem 1.4rem;
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  animation: ax-fade-in 0.55s ease 0.5s both;
+}
+
+.ax-splash-cta:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(196, 168, 130, 0.25);
+}
+
+@keyframes ax-splash-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes ax-splash-out {
+  to {
+    opacity: 0;
+    transform: scale(1.02);
+  }
+}
+
+@keyframes ax-splash-brand {
+  from {
+    opacity: 0;
+    letter-spacing: 0.2em;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    letter-spacing: 0.06em;
+    transform: none;
+  }
+}
+
+@keyframes ax-splash-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
 }
