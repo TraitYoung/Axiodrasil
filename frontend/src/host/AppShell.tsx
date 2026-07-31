@@ -4,10 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 
-const NAV = [
-  { href: "/group", label: "群聊" },
-  { href: "/solo", label: "单人" },
-] as const;
+const NAV = [{ href: "/solo", label: "Bina" }] as const;
 
 export function AppShell({
   children,
@@ -24,9 +21,9 @@ export function AppShell({
     <div className="ax-shell min-h-screen flex flex-col">
       <header className="ax-header sticky top-0 z-20 border-b border-[var(--ax-line)] backdrop-blur-md">
         <div className="mx-auto flex max-w-6xl items-center gap-4 px-4 py-3">
-          <Link href="/group" className="ax-brand shrink-0">
+          <Link href="/solo" className="ax-brand shrink-0">
             <span className="ax-brand-mark">Axiodrasil</span>
-            <span className="ax-brand-sub">内阁</span>
+            <span className="ax-brand-sub">Bina</span>
           </Link>
           <nav className="flex items-center gap-1 rounded-full border border-[var(--ax-line)] bg-[var(--ax-panel)] p-1">
             {NAV.map((item) => {

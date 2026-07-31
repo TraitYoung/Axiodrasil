@@ -42,6 +42,8 @@ export type StreamChatInput = {
   sessionId: string;
   forcedPersona?: string | null;
   stripPersonaPrefix?: boolean;
+  /** true=群聊写 M1；false=单聊不写 M1。缺省由后端按 forced_persona 回退。 */
+  groupMode?: boolean;
   workflowMode?: string;
   signal?: AbortSignal;
   onMeta?: (meta: ChatStreamMeta) => void;

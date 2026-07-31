@@ -114,6 +114,7 @@ export function GroupChatView() {
         sessionId,
         forcedPersona: forced,
         stripPersonaPrefix: Boolean(forced),
+        groupMode: true,
         onDelta: (chunk) => {
           acc += chunk;
           setMessages((prev) =>

@@ -77,6 +77,7 @@ class ChatPort(Protocol):
         session_id: str,
         forced_persona: Optional[str] = None,
         strip_persona_prefix: bool = False,
+        group_mode: Optional[bool] = None,
         workflow_mode: str = "default",
         trace_id: Optional[str] = None,
     ) -> ChatStreamResult: ...

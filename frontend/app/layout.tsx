@@ -20,8 +20,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Axiodrasil · 内阁",
-  description: "Axiodrasil 内阁群聊与单人谈话",
+  title: "Axiodrasil · Bina",
+  description: "Axiodrasil Bina 单人谈话",
 };
 
 export default function RootLayout({

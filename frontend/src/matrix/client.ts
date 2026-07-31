@@ -72,6 +72,7 @@ export async function streamChat(input: StreamChatInput): Promise<{
     strip_persona_prefix: Boolean(input.stripPersonaPrefix),
   };
   if (input.forcedPersona) body.forced_persona = input.forcedPersona;
+  if (typeof input.groupMode === "boolean") body.group_mode = input.groupMode;
   if (input.workflowMode && input.workflowMode !== "default") {
     body.workflow_mode = input.workflowMode;
   }

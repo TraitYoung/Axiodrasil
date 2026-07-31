@@ -13,6 +13,7 @@ export async function POST(req: NextRequest) {
     workflow_mode?: string;
     forced_persona?: string | null;
     strip_persona_prefix?: boolean;
+    group_mode?: boolean;
   } = {};
   try {
     payload = await req.json();
@@ -33,6 +34,9 @@ export async function POST(req: NextRequest) {
   }
   if (typeof payload.strip_persona_prefix === "boolean") {
     backendBody.strip_persona_prefix = payload.strip_persona_prefix;
+  }
+  if (typeof payload.group_mode === "boolean") {
+    backendBody.group_mode = payload.group_mode;
   }
 
   const backendUrl = `${getBackendBaseUrl()}/api/v1/chat/stream`;

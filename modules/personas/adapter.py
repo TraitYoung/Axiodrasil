@@ -29,13 +29,16 @@ PERSONA_COLORS: dict[str, str] = {
 
 GROUP_SESSION_ID = "ax-cabinet-main"
 
+# 公开 catalog 仅暴露 Bina；完整 PERSONA_META 仍保留以便路由/历史/未来复制人格。
+PUBLIC_PERSONA_IDS: tuple[str, ...] = ("bina",)
+
 
 class PersonaCatalog:
     """从 PERSONA_META + group 角色卡 JSON 组装只读视图模型。"""
 
     def list_cards(self) -> list[PersonaCard]:
         cards: list[PersonaCard] = []
-        for pid in PERSONA_META.keys():
+        for pid in PUBLIC_PERSONA_IDS:
             card = self.get_card(pid)
             if card:
                 cards.append(card)

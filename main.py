@@ -171,6 +171,10 @@ class ChatRequest(BaseModel):
         default=False,
         description="True 时对外回复去掉 [persona]: 前缀（Group Chat 气泡已有角色名）",
     )
+    group_mode: Optional[bool] = Field(
+        default=None,
+        description="True=群聊写 M1；False=单聊不写 M1（仍可写 M2 私忆）。缺省时回退为 bool(forced_persona)",
+    )
 
 
 class ChatResponse(BaseModel):
@@ -246,6 +250,13 @@ def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskInten
     return reply_out, intent, trace_raw, str(active_task_type), str(active_persona or prefix)
 
 
+def _resolve_group_mode(payload: ChatRequest) -> bool:
+    """显式 group_mode 优先；未传时兼容旧客户端：有 forced_persona 视为群聊。"""
+    if payload.group_mode is not None:
+        return bool(payload.group_mode)
+    return bool(payload.forced_persona)
+
+
 def _after_turn_memory(
     session_id: str,
     user_text: str,
@@ -254,7 +265,12 @@ def _after_turn_memory(
     *,
     group_mode: bool,
 ) -> str:
-    """写回 L1、可选 M1/M2，并在散会口令时压缩进 M3。返回可能带前缀的持久化文本。"""
+    """写回 L1、可选 M1/M2，并在散会口令时压缩进 M3。返回可能带前缀的持久化文本。
+
+    - L1/L2：始终写回
+    - M1 吵架缓冲：仅群聊
+    - M2 人设私忆：有 active_persona 即调度（单聊 Bina 也需要）
+    """
     labeled = reply_for_client
     if not re.match(r"^\s*\[[^\]]+]\s*[:：]", reply_for_client or ""):
         labeled = f"[{active_persona}]: {reply_for_client}"
@@ -262,25 +278,27 @@ def _after_turn_memory(
     _persist_turn(session_id, user_text, labeled)
     maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
 
+    clean_assistant = re.sub(r"^\s*\[[^\]]+]\s*[:：]\s*", "", labeled)
+
     if group_mode and active_persona:
         try:
             append_debate_exchange(
                 session_id,
                 user_text=user_text,
-                assistant_text=re.sub(
-                    r"^\s*\[[^\]]+]\s*[:：]\s*", "", labeled
-                ),
+                assistant_text=clean_assistant,
                 persona=active_persona,
             )
         except Exception as e:
             print(f"⚠️ [cabinet] M1 写回失败: {e}")
+
+    if active_persona:
         try:
             async_tasks.schedule(
                 extract_persona_private,
                 session_id,
                 active_persona,
                 user_text=user_text,
-                assistant_text=re.sub(r"^\s*\[[^\]]+]\s*[:：]\s*", "", labeled),
+                assistant_text=clean_assistant,
             )
         except Exception as e:
             print(f"⚠️ [cabinet] M2 私忆调度失败: {e}")
@@ -319,7 +337,7 @@ async def chat_api(
         payload.text,
         reply,
         active_persona,
-        group_mode=bool(payload.forced_persona),
+        group_mode=_resolve_group_mode(payload),
     )
 
     trace = [TraceStep.model_validate(s) for s in trace_raw]
@@ -359,7 +377,7 @@ async def chat_stream_api(
         payload.text,
         reply,
         active_persona,
-        group_mode=bool(payload.forced_persona),
+        group_mode=_resolve_group_mode(payload),
     )
 
     trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
@@ -570,12 +588,13 @@ async def openai_compat_chat_completions(
         model=payload.model,
         messages=payload.messages,
     )
-    # Group Chat：有强制人设时去前缀；无强制时保持旧单卡前缀行为
+    # Group Chat：有强制人设时去前缀并写 M1；无强制时保持旧单卡前缀行为
     group_mode = forced is not None
     chat_payload = ChatRequest(
         text=user_text,
         forced_persona=forced,
         strip_persona_prefix=group_mode,
+        group_mode=group_mode,
     )
     try:
         reply, _intent, _trace_raw, _active, active_persona = _execute_turn(

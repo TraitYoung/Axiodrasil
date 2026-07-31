@@ -4,7 +4,7 @@ This file provides guidance to Lingma (lingma.aliyun.com) when working with code
 
 ## Project Overview
 
-Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure study/project scenarios. It uses LangGraph + DeepSeek（默认）/ Qwen  to route user inputs to specialized agents ("内阁/cabinet"), backed by an L3 memory matrix (SQLite + FTS5 + vector embeddings) and Hybrid RAG retrieval. Primary interactive front-end is the **Next.js 内阁 UI**（默认群聊 `/group` + 单人 `/solo`）；SillyTavern Group Chat 仍可通过 `/v1` 接入。
+Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure study/project scenarios. It uses LangGraph + DeepSeek（默认）/ Qwen  to route user inputs to specialized agents ("内阁/cabinet"), backed by an L3 memory matrix (SQLite + FTS5 + vector embeddings) and Hybrid RAG retrieval. Primary interactive front-end is the **Next.js Bina 单聊**（`/` → `/solo`）；群聊 `/group` 与旧 `/lab` 已软归档（见 `docs/archive_ui.md`）。SillyTavern Group Chat 仍可通过 `/v1` 接入。
 
 ### Host + 接口矩阵（模块化）
 
@@ -18,7 +18,7 @@ Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure
 | `modules/personas/` | 角色卡 catalog（`GET /api/v1/personas`） |
 | `modules/chat_api/` | Chat / Health / Trace 适配外壳 |
 | `modules/cabinet_memory/` | 散会共识适配 |
-| `frontend/src/host` + `matrix` + `modules/*` | 前端壳与群聊/单人/角色卡模块；群聊入口含网页开屏 `SplashGate` |
+| `frontend/src/host` + `matrix` + `modules/*` | 前端壳与 Bina 单聊（主入口）/群聊软归档/角色卡模块 |
 | `launcher/` | Windows 桌面启动器（CustomTkinter → PyInstaller exe），调用 `scripts/dev_stack.ps1` |
 
 新能力应经矩阵 Port 接入，避免在 Host 内堆业务。旧演示台移至 `frontend/app/lab`。
@@ -69,7 +69,7 @@ python -m launcher
 # 打包：
 .\launcher\build_exe.ps1
 ```
-打开浏览器后进入 `/group` 会先看到网页开屏（本会话一次）。若找不到项目根，设置 `AX_PROJECT_ROOT` 为仓库根路径。
+打开浏览器后默认进入 `/solo`（Bina 单聊）。若找不到项目根，设置 `AX_PROJECT_ROOT` 为仓库根路径。
 
 Or manually in 3 terminals:
 ```powershell

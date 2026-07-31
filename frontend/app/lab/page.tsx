@@ -93,6 +93,7 @@ function personaDisplayName(persona?: string): string {
 
 type UiMode = "chat" | "clean" | "dev_pipeline";
 
+/** 软归档旧演示台：公开入口已收敛到 /solo；恢复说明见 docs/archive_ui.md */
 export default function Home() {
   const TURN_LIMIT = 50;
   const [mode, setMode] = useState<UiMode>("chat");

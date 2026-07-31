@@ -58,6 +58,7 @@ class ChatAdapter:
         session_id: str,
         forced_persona: Optional[str] = None,
         strip_persona_prefix: bool = False,
+        group_mode: Optional[bool] = None,
         workflow_mode: str = "default",
         trace_id: Optional[str] = None,
     ) -> ChatStreamResult:
@@ -68,6 +69,7 @@ class ChatAdapter:
             workflow_mode=workflow_mode,  # type: ignore[arg-type]
             forced_persona=forced_persona,
             strip_persona_prefix=strip_persona_prefix,
+            group_mode=group_mode,
         )
         reply, intent, trace_raw, _active, active_persona = core._execute_turn(
             payload, session_id
@@ -77,7 +79,7 @@ class ChatAdapter:
             text,
             reply,
             active_persona,
-            group_mode=bool(forced_persona),
+            group_mode=core._resolve_group_mode(payload),
         )
         return ChatStreamResult(
             session_id=session_id,

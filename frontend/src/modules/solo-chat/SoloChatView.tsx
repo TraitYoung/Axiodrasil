@@ -1,59 +1,49 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { AppShell } from "@/host/AppShell";
 import { useUserLocalId } from "@/infra/session";
 import {
   fetchHistory,
-  listPersonas,
+  getPersona,
   parsePersonaFromReply,
   streamChat,
 } from "@/matrix/client";
 import { soloSessionId, type PersonaCard } from "@/matrix/types";
-import { PersonaCardTile } from "@/modules/persona-cards/PersonaCardTile";
+import { PersonaAvatar } from "@/modules/persona-cards/PersonaAvatar";
 import { MessageList, type BubbleMessage } from "@/modules/group-chat/MessageList";
+
+const BINA_ID = "bina";
 
 function uid() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-const SELECTED_KEY = "ax-solo-persona";
-
 export function SoloChatView() {
   const userLocalId = useUserLocalId();
-  const [cards, setCards] = useState<PersonaCard[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [card, setCard] = useState<PersonaCard | null>(null);
   const [messages, setMessages] = useState<BubbleMessage[]>([]);
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  const selected = useMemo(
-    () => cards.find((c) => c.id === selectedId) || null,
-    [cards, selectedId],
-  );
-
   const sessionId = useMemo(() => {
-    if (!selectedId || !userLocalId) return "";
-    return soloSessionId(selectedId, userLocalId);
-  }, [selectedId, userLocalId]);
+    if (!userLocalId) return "";
+    return soloSessionId(BINA_ID, userLocalId);
+  }, [userLocalId]);
 
   const personaMap = useMemo(() => {
-    const m: Record<string, PersonaCard> = {};
-    for (const c of cards) m[c.id] = c;
-    return m;
-  }, [cards]);
+    if (!card) return {};
+    return { [card.id]: card };
+  }, [card]);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       try {
-        const list = await listPersonas();
-        if (cancelled) return;
-        setCards(list);
-        const saved = localStorage.getItem(SELECTED_KEY);
-        if (saved && list.some((c) => c.id === saved)) setSelectedId(saved);
+        const bina = await getPersona(BINA_ID);
+        if (!cancelled) setCard(bina);
       } catch (e) {
         if (!cancelled) setError(e instanceof Error ? e.message : String(e));
       }
@@ -64,7 +54,7 @@ export function SoloChatView() {
   }, []);
 
   useEffect(() => {
-    if (!sessionId || !selectedId) {
+    if (!sessionId || !card) {
       setMessages([]);
       return;
     }
@@ -81,16 +71,16 @@ export function SoloChatView() {
               id: uid(),
               role: "assistant",
               content: t.assistant,
-              personaId: selectedId,
+              personaId: BINA_ID,
             });
           }
         }
-        if (bubbles.length === 0 && selected?.greeting) {
+        if (bubbles.length === 0 && card.greeting) {
           bubbles.push({
             id: uid(),
             role: "assistant",
-            content: selected.greeting,
-            personaId: selectedId,
+            content: card.greeting,
+            personaId: BINA_ID,
           });
         }
         setMessages(bubbles);
@@ -101,21 +91,15 @@ export function SoloChatView() {
     return () => {
       cancelled = true;
     };
-  }, [sessionId, selectedId, selected?.greeting]);
+  }, [sessionId, card]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
-  const pickPersona = useCallback((card: PersonaCard) => {
-    setSelectedId(card.id);
-    localStorage.setItem(SELECTED_KEY, card.id);
-    setError(null);
-  }, []);
-
   const onSend = async () => {
     const raw = text.trim();
-    if (!raw || busy || !selectedId || !sessionId) return;
+    if (!raw || busy || !sessionId) return;
     setBusy(true);
     setError(null);
     setText("");
@@ -123,15 +107,16 @@ export function SoloChatView() {
     setMessages((prev) => [
       ...prev,
       { id: uid(), role: "user", content: raw },
-      { id: pendingId, role: "assistant", content: "", personaId: selectedId, pending: true },
+      { id: pendingId, role: "assistant", content: "", personaId: BINA_ID, pending: true },
     ]);
     try {
       let acc = "";
       const { reply, meta } = await streamChat({
         text: raw,
         sessionId,
-        forcedPersona: selectedId,
+        forcedPersona: BINA_ID,
         stripPersonaPrefix: true,
+        groupMode: false,
         onDelta: (chunk) => {
           acc += chunk;
           setMessages((prev) =>
@@ -145,7 +130,7 @@ export function SoloChatView() {
             ? {
                 ...m,
                 content: reply || acc,
-                personaId: meta?.active_persona || selectedId || parsePersonaFromReply(reply),
+                personaId: meta?.active_persona || BINA_ID || parsePersonaFromReply(reply),
                 pending: false,
               }
             : m,
@@ -161,7 +146,7 @@ export function SoloChatView() {
 
   return (
     <AppShell
-      subtitle={selected ? `与 ${selected.name} 密谈` : "选择谈话对象"}
+      subtitle={card ? `与 ${card.name} 密谈` : "Bina 单人谈话"}
       actions={
         sessionId ? (
           <span className="hidden text-xs text-[var(--ax-muted)] lg:inline">{sessionId}</span>
@@ -169,40 +154,46 @@ export function SoloChatView() {
       }
     >
       <div className="ax-stage flex min-h-0 flex-1 flex-col gap-4 md:flex-row">
-        <aside className="ax-roster flex w-full flex-col gap-2 md:w-64 lg:w-72">
+        <aside className="ax-roster flex w-full flex-col gap-3 md:w-64 lg:w-72">
           <h2 className="px-1 text-xs font-medium uppercase tracking-wider text-[var(--ax-muted)]">
-            选择角色卡
+            谈话对象
           </h2>
-          <div className="space-y-2 overflow-y-auto">
-            {cards.map((c) => (
-              <PersonaCardTile
-                key={c.id}
-                card={c}
-                compact
-                selected={c.id === selectedId}
-                onSelect={pickPersona}
-              />
-            ))}
-          </div>
+          {card ? (
+            <div className="ax-card-tile space-y-3 p-3">
+              <div className="flex items-start gap-3">
+                <PersonaAvatar persona={card} size={48} />
+                <div className="min-w-0">
+                  <p className="font-medium text-[var(--ax-fg)]">{card.name}</p>
+                  <p className="text-xs text-[var(--ax-muted)]">{card.title}</p>
+                </div>
+              </div>
+              {card.personality ? (
+                <p className="text-xs leading-relaxed text-[var(--ax-muted)]">{card.personality}</p>
+              ) : null}
+              <p className="text-xs leading-relaxed text-[var(--ax-muted)]">
+                当前全力开发 Bina 单聊；其他内阁成员已从公开入口软归档，会话与群聊记忆隔离。
+              </p>
+            </div>
+          ) : (
+            <p className="px-1 text-sm text-[var(--ax-muted)]">正在加载 Bina…</p>
+          )}
         </aside>
 
         <section className="ax-chat-panel flex min-h-[70vh] flex-1 flex-col overflow-hidden">
-          {!selectedId ? (
+          {!card ? (
             <div className="ax-empty flex flex-1 flex-col items-center justify-center gap-2 text-center">
               <p className="font-[family-name:var(--font-display)] text-2xl tracking-wide">
-                单人谈话
+                Bina 单人谈话
               </p>
-              <p className="max-w-sm text-sm text-[var(--ax-muted)]">
-                从左侧选择一位内阁成员；会话与群聊记忆隔离。
-              </p>
+              <p className="max-w-sm text-sm text-[var(--ax-muted)]">正在接通首席私人秘书…</p>
             </div>
           ) : (
             <>
               <MessageList
                 messages={messages}
                 personaMap={personaMap}
-                emptyTitle={selected?.name || "单人谈话"}
-                emptyHint={selected?.personality || "开始对话。"}
+                emptyTitle={card.name}
+                emptyHint={card.personality || "先共情，再讲理。直接说就好。"}
               />
               <div ref={bottomRef} />
               {error ? <p className="px-2 text-sm text-red-600">{error}</p> : null}
@@ -210,7 +201,7 @@ export function SoloChatView() {
                 <div className="flex flex-col gap-2">
                   <textarea
                     className="ax-input min-h-[72px] w-full resize-y"
-                    placeholder={`对 ${selected?.name || ""} 说…`}
+                    placeholder="对 Bina 说… 吐槽、撒娇、汇报状态都行"
                     value={text}
                     disabled={busy}
                     onChange={(e) => setText(e.target.value)}

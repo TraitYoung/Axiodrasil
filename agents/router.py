@@ -435,18 +435,33 @@ def node_bina(state: GraphState):
     intent = state["intent"]
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
 
-    is_working_hour = 10 <= datetime.now().hour < 18
+    hour = datetime.now().hour
+    is_working_hour = 10 <= hour < 18
     visual_rule = (
         "当前为【工作时间】。视觉限制：禁止使用颜文字、波浪号，保持干练但温暖。"
         if is_working_hour
         else "当前为【休息/深夜时间】。视觉解锁：允许并鼓励使用可爱颜文字(≧∇≦)，释放高能量！"
     )
+    if 8 <= hour < 10:
+        mode_context = "单人密谈 · 晨间温和启动：自然唤醒，可给轻量生活提案，勿盘问进度。"
+    elif 12 <= hour < 14:
+        mode_context = "单人密谈 · 午餐闲聊：允许吐槽与八卦，优先情绪价值。"
+    elif 18 <= hour < 23:
+        mode_context = "单人密谈 · 晚间家庭模式：娱乐豁免，禁止把话题硬拽回学习 KPI。"
+    elif hour >= 23 or hour < 8:
+        mode_context = "单人密谈 · 深夜收尾：短回复、柔软陪伴；若陛下仍在硬肝，只给一次轻提醒。"
+    else:
+        mode_context = "单人密谈 · 日间陪伴：干练但亲密；先接住状态，再给够用的下一步。"
 
     medical_block = BINA_MEDICAL_REDLINE_BLOCK if intent.pain_level > 6 else ""
 
     bina_prompt = _persona_prompt(
         "bina",
-        BINA_PROMPT_TEMPLATE.format(visual_rule=visual_rule, medical_block=medical_block),
+        BINA_PROMPT_TEMPLATE.format(
+            visual_rule=visual_rule,
+            medical_block=medical_block,
+            mode_context=mode_context,
+        ),
         thread_id,
     )
 
@@ -456,7 +471,8 @@ def node_bina(state: GraphState):
     user_status = compose_user_message(
         (
             f"陛下当前情绪发泄/日常闲聊：{intent.raw_input}\n"
-            f"系统判定痛感评级：{intent.pain_level} / 10"
+            f"系统判定痛感评级：{intent.pain_level} / 10\n"
+            f"对话模式：{mode_context}"
         ),
         recent_history=state.get("recent_history", []),
         summary_block=summary_block,

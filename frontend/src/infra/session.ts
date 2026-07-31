@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useSyncExternalStore } from "react";
 
 const USER_LOCAL_KEY = "ax-user-local-id";
 
@@ -14,10 +14,12 @@ export function getOrCreateUserLocalId(): string {
   return id;
 }
 
+function subscribe(_onStoreChange: () => void) {
+  void _onStoreChange;
+  // 本地 ID 只在首次创建后固定，无需跨标签同步。
+  return () => {};
+}
+
 export function useUserLocalId(): string {
-  const [id, setId] = useState("");
-  useEffect(() => {
-    setId(getOrCreateUserLocalId());
-  }, []);
-  return id;
+  return useSyncExternalStore(subscribe, getOrCreateUserLocalId, () => "");
 }
