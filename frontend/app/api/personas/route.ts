@@ -6,7 +6,10 @@ export const runtime = "nodejs";
 export async function GET() {
   const backendUrl = `${getBackendBaseUrl()}/api/v1/personas`;
   try {
-    const res = await fetch(backendUrl, { cache: "no-store" });
+    const res = await fetch(backendUrl, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8_000),
+    });
     const text = await res.text();
     return new NextResponse(text, {
       status: res.status,

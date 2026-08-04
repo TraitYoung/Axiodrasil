@@ -1,9 +1,7 @@
 """
 Chat / Health / Trace 适配器。
 
-HTTP 路由仍由根 `main.py` 承载；本适配器供 Host 注册表与其他模块
-通过矩阵调用，避免直连 FastAPI 细节。ChatAdapter.stream 走内部
-同步执行路径（与 SSE 同源逻辑），便于脚本/测试复用。
+经 TurnService 执行回合，禁止反向 import main。
 """
 
 from __future__ import annotations
@@ -12,22 +10,22 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from app.matrix.ports import ChatStreamResult, ChatTurn, HealthStatus, TraceStepView
+from modules.chat_api.service import (
+    TurnRequest,
+    get_shared_session_cache,
+    get_turn_service,
+    resolve_group_mode,
+)
 
 
 class HealthAdapter:
     def check(self) -> HealthStatus:
         from infra import get_chat_model, get_llm_provider
-        from memory.session_cache import SessionCache
 
-        redis_ok = False
-        try:
-            SessionCache(ttl_seconds=3600, window_size=5).client.ping()
-            redis_ok = True
-        except Exception:
-            pass
+        cache = get_shared_session_cache()
         return HealthStatus(
             ok=True,
-            redis=redis_ok,
+            redis=cache.ping(),
             llm_provider=get_llm_provider(),
             chat_model=get_chat_model(),
         )
@@ -49,7 +47,7 @@ class TraceAdapter:
 
 
 class ChatAdapter:
-    """包装 main._execute_turn / history；延迟 import 避免循环。"""
+    """包装 TurnService；供矩阵与脚本复用。"""
 
     async def stream(
         self,
@@ -62,39 +60,35 @@ class ChatAdapter:
         workflow_mode: str = "default",
         trace_id: Optional[str] = None,
     ) -> ChatStreamResult:
-        import main as core
-
-        payload = core.ChatRequest(
+        svc = get_turn_service()
+        payload = TurnRequest(
             text=text,
             workflow_mode=workflow_mode,  # type: ignore[arg-type]
             forced_persona=forced_persona,
             strip_persona_prefix=strip_persona_prefix,
             group_mode=group_mode,
         )
-        reply, intent, trace_raw, _active, active_persona = core._execute_turn(
-            payload, session_id
-        )
-        core._after_turn_memory(
+        result = svc.run(payload, session_id)
+        svc.after_turn(
             session_id,
             text,
-            reply,
-            active_persona,
-            group_mode=core._resolve_group_mode(payload),
+            result.reply,
+            result.active_persona,
+            group_mode=resolve_group_mode(payload),
         )
         return ChatStreamResult(
             session_id=session_id,
-            reply=reply,
-            active_persona=active_persona,
-            intent=intent.model_dump() if hasattr(intent, "model_dump") else {},
+            reply=result.reply,
+            active_persona=result.active_persona,
+            intent=result.intent.model_dump() if hasattr(result.intent, "model_dump") else {},
             trace_id=(trace_id or "").strip() or str(uuid4()),
-            trace=list(trace_raw or []),
+            trace=list(result.trace_raw or []),
         )
 
     def history(self, session_id: str, *, limit: int = 50) -> list[ChatTurn]:
-        import main as core
         import re
 
-        turns = core._load_history_turns(session_id, limit=limit)
+        turns = get_turn_service().load_history_ui(session_id, limit=limit)
         out: list[ChatTurn] = []
         for t in turns:
             assistant = t.get("assistant", "") or ""
@@ -113,7 +107,6 @@ class ChatAdapter:
         return out
 
     def export(self, session_id: str, *, limit: int = 20) -> dict[str, Any]:
-        # 导出仍走 HTTP 层；此处仅返回 history 快照
         turns = self.history(session_id, limit=limit)
         return {
             "session_id": session_id,

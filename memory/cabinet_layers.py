@@ -113,7 +113,7 @@ def close_and_compress(thread_id: str) -> Optional[str]:
                     parts.append("行动：" + "；".join(result.action_items[:3]))
                 summary_text = " ".join(parts) or "内阁已散会，本轮争执已归档。"
         except Exception as e:
-            print(f"⚠️ [cabinet] 共识压缩失败，回退截断原文: {e}")
+            print(f"[cabinet] compress failed, truncate fallback: {e}")
             summary_text = transcript[:800]
 
     if not summary_text:

@@ -32,9 +32,10 @@ def maybe_trigger_rolling_summary(session_id: str, session_cache, memory_db: Per
                     enrichment.generate_rolling_summary,
                     thread_id=session_id,
                     turns=recent_turns,
+                    db_path=memory_db.db_path,
                 )
     except Exception as e:
-        print(f"⚠️ [rolling-summary] 计数/调度失败（不影响主流程）: {e}")
+        print(f"[rolling-summary] counter/schedule failed: {e}")
 
 
 __all__ = ["maybe_trigger_rolling_summary"]

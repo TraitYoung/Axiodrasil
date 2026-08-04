@@ -23,7 +23,7 @@ export async function GET(req: NextRequest) {
     backendRes = await fetch(backendUrl, {
       method: "GET",
       headers,
-      signal: AbortSignal.timeout(30_000),
+      signal: AbortSignal.timeout(8_000),
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

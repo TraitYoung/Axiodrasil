@@ -33,9 +33,15 @@ class PersonaMemory:
     def encryption_enabled(self) -> bool:
         return crypto.is_enabled()
 
+    def _connect(self) -> sqlite3.Connection:
+        # 短 busy 等待：跨 WSL/UNC 访问时避免整轮请求卡死数十秒
+        conn = sqlite3.connect(self.db_path, timeout=1.0)
+        conn.execute("PRAGMA busy_timeout=1000")
+        return conn
+
     def _init_db(self) -> None:
         """初始化记忆矩阵表 + FTS5 视图 + 向量表 + 滚动摘要/细粒度记忆/实体表"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             # 1) 原始记忆矩阵
             conn.execute(
                 """
@@ -296,7 +302,7 @@ class PersonaMemory:
         返回新写入行的 id，便于上层（异步提取任务）关联 source_memory_id。
         """
         stored_content = self._encrypt(content)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO memory_matrix (thread_id, content, quadrant) VALUES (?, ?, ?)",
                 (thread_id, stored_content, quadrant),
@@ -306,7 +312,7 @@ class PersonaMemory:
 
     def save_memory_embedding(self, memory_id: int, embedding_blob: bytes) -> None:
         """在线写入 matrix 向量；与 migration 冷启动路径共用同一表。"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO memory_embeddings (memory_id, embedding)
@@ -319,7 +325,7 @@ class PersonaMemory:
 
     def get_active_q1(self, thread_id: str) -> List[str]:
         """获取指定对话下所有未完成的 Q1 (重要且紧急) 指令，用于注入上下文"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.execute(
                 """
                 SELECT content
@@ -334,7 +340,7 @@ class PersonaMemory:
     # ==================== 滚动摘要层 ====================
     def bump_turn_counter(self, thread_id: str) -> int:
         """每完成一轮对话调用一次，返回自上次摘要以来累计的轮数。"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO memory_turn_counters (thread_id, turns_since_summary, total_turns)
@@ -354,7 +360,7 @@ class PersonaMemory:
         return int(row[0]) if row else 0
 
     def reset_turn_counter(self, thread_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 "UPDATE memory_turn_counters SET turns_since_summary = 0 WHERE thread_id = ?",
                 (thread_id,),
@@ -369,7 +375,7 @@ class PersonaMemory:
         range_end_ts: str,
         turn_count: int,
     ) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO memory_summaries
@@ -382,7 +388,7 @@ class PersonaMemory:
             return int(cur.lastrowid)
 
     def get_recent_summaries(self, thread_id: str, limit: int = 3) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT summary, range_start_ts, range_end_ts, turn_count, created_at
@@ -415,7 +421,7 @@ class PersonaMemory:
         persona: str = "",
     ) -> int:
         stored_content = self._encrypt(content)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO memory_fragments
@@ -428,7 +434,7 @@ class PersonaMemory:
             return int(cur.lastrowid)
 
     def save_fragment_embedding(self, fragment_id: int, embedding_blob: bytes) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO memory_fragment_embeddings (fragment_id, embedding)
@@ -466,7 +472,7 @@ class PersonaMemory:
             params.append(persona)
         sql += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(sql, params)
             rows = cur.fetchall()
         return [
@@ -482,7 +488,7 @@ class PersonaMemory:
 
     # ==================== 内阁吵架层 M1 ====================
     def get_debate_status(self, thread_id: str) -> str:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             row = conn.execute(
                 "SELECT status FROM cabinet_debate_state WHERE thread_id = ?",
                 (thread_id,),
@@ -490,7 +496,7 @@ class PersonaMemory:
         return str(row[0]) if row else "closed"
 
     def open_debate(self, thread_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO cabinet_debate_state (thread_id, status, opened_at, closed_at)
@@ -505,7 +511,7 @@ class PersonaMemory:
             conn.commit()
 
     def close_debate(self, thread_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO cabinet_debate_state (thread_id, status, closed_at)
@@ -521,7 +527,7 @@ class PersonaMemory:
     def append_debate_turn(
         self, thread_id: str, speaker: str, role: str, content: str
     ) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO cabinet_debate_turns (thread_id, speaker, role, content)
@@ -533,7 +539,7 @@ class PersonaMemory:
             return int(cur.lastrowid)
 
     def get_debate_turns(self, thread_id: str, limit: int = 30) -> List[Dict[str, str]]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT speaker, role, content, created_at
@@ -557,7 +563,7 @@ class PersonaMemory:
         return turns
 
     def clear_debate_turns(self, thread_id: str) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 "DELETE FROM cabinet_debate_turns WHERE thread_id = ?",
                 (thread_id,),
@@ -574,7 +580,7 @@ class PersonaMemory:
         action_items: str = "",
         source_turn_count: int = 0,
     ) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO cabinet_consensus
@@ -594,7 +600,7 @@ class PersonaMemory:
             return int(cur.lastrowid)
 
     def get_recent_consensus(self, thread_id: str, limit: int = 3) -> List[Dict[str, Any]]:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT summary, conclusions, unresolved, action_items,
@@ -620,7 +626,7 @@ class PersonaMemory:
 
     # ==================== 实体聚合 ====================
     def upsert_entity(self, thread_id: str, name: str, entity_type: str) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO entities (thread_id, name, entity_type)
@@ -638,7 +644,7 @@ class PersonaMemory:
         return int(row[0])
 
     def link_entity(self, entity_id: int, memory_id: int, source: str = "matrix") -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO entity_memory_links (entity_id, memory_id, source)
@@ -660,7 +666,7 @@ class PersonaMemory:
         if thread_id is not None:
             sql += " WHERE thread_id = ?"
             params.append(thread_id)
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             entity_rows = conn.execute(sql, params).fetchall()
 
             matched_ids = [eid for eid, name in entity_rows if name and name in query]
@@ -684,7 +690,7 @@ class PersonaMemory:
 
     # ==================== 会话 turn 持久化 ====================
     def append_chat_turn(self, thread_id: str, user_text: str, assistant_text: str) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO chat_turns (thread_id, user_text, assistant_text)
@@ -697,7 +703,7 @@ class PersonaMemory:
 
     def get_chat_turns(self, thread_id: str, limit: int = 50) -> List[Dict[str, str]]:
         """返回旧→新的 turn 列表，字段与 SessionCache.get_recent_turns 对齐。"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT user_text, assistant_text, created_at

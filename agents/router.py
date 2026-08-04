@@ -18,14 +18,11 @@ from langgraph.prebuilt import create_react_agent
 
 from infrastructure.container import get_llm, get_memory_db, get_mood_engine
 from memory import async_tasks, enrichment
-from memory.context_inject import (
-    compose_cabinet_context,
-    compose_user_message,
-    format_fragments_block,
-    format_summaries_block,
-)
+from memory.context_inject import compose_user_message
+from memory.turn_context import TurnContext, build_turn_context
 from hybrid_engine import get_hybrid_retriever
 from prompts import system_prompts
+from prompts.bina_context import build_bina_mode_context
 from prompts.system_prompts import (
     BINA_MEDICAL_REDLINE_BLOCK,
     BINA_PROMPT_TEMPLATE,
@@ -56,6 +53,7 @@ from agents.persona_meta import (
 )
 from agents.route_resolver import resolve_route as _resolve_route
 from agents.route_resolver import route_by_intent
+from agents.solo_fast import synthesize_solo_bina_intent
 
 # 给主线任务设定一个固定的 Thread ID
 MAIN_THREAD_ID = "TraitYoung_Main"
@@ -76,19 +74,27 @@ class GraphState(TypedDict):
     resolved_route_key: NotRequired[str]
     # 酒馆 Group Chat 强制说话人；None/缺省则走完整路由。
     forced_persona: NotRequired[str]
+    # Solo Bina 快速通道：跳过全量 parser LLM
+    solo_fast: NotRequired[bool]
+    # 回合预取记忆（summary/history/fragments/cabinet）
+    turn_context: NotRequired[TurnContext]
+    # 对话 id（L1/L2）；缺省等于 thread_id。Mood/L3 仍用 thread_id（记忆池）
+    conversation_id: NotRequired[str]
 
 
 # 2. 通用工具函数 ───────────────────────────────────────────────────
 
 def _persona_prompt(persona: str, base_prompt: str, thread_id: str) -> str:
-    """把 mood_engine 的状态描述统一拼进任意人格的 system prompt，实现
-    「固定人格 + 动态状态 + 动态记忆」三层叠加里的第二层，跨节点共享。"""
+    """固定人格 + 动态 mood + 正/负向风格提示，跨节点共享。"""
+    from prompts.steering import with_style_steering
+
     mood_engine = get_mood_engine()
-    return system_prompts.with_mood_context(
+    with_mood = system_prompts.with_mood_context(
         base_prompt,
         mood_engine.get_prompt_context(thread_id),
         mood_engine.get_style_guidance(thread_id),
     )
+    return with_style_steering(with_mood, persona)
 
 
 def _memory_blocks_for_reply(
@@ -96,29 +102,55 @@ def _memory_blocks_for_reply(
     *,
     include_fragments: bool = False,
     persona: str = "",
+    turn_context: TurnContext | None = None,
 ) -> tuple[str, str, str]:
     """人格回复侧：L2 摘要 + 可选共享碎片 + 内阁三层（M3→M2→M1）。"""
-    memory_db = get_memory_db()
-    summary_block = ""
-    fragment_block = ""
-    cabinet_block = ""
-    try:
-        summary_block = format_summaries_block(memory_db, thread_id)
-    except Exception as e:
-        print(f"⚠️ [memory] 摘要回注失败: {e}")
-    if include_fragments:
-        try:
-            # 共享碎片（persona 空）；人设私忆走 cabinet M2
-            fragment_block = format_fragments_block(
-                memory_db, thread_id, shared_only=True
-            )
-        except Exception as e:
-            print(f"⚠️ [memory] 碎片回注失败: {e}")
-    try:
-        cabinet_block = compose_cabinet_context(memory_db, thread_id, persona)
-    except Exception as e:
-        print(f"⚠️ [memory] 内阁三层注入失败: {e}")
+    ctx = turn_context or build_turn_context(
+        thread_id, memory_thread_id=thread_id, prefetch_summary=True
+    )
+    summary_block = ctx.summary_block or ""
+    fragment_block = ctx.ensure_fragments() if include_fragments else ""
+    cabinet_block = ctx.ensure_cabinet(persona)
     return summary_block, fragment_block, cabinet_block
+
+
+def _tick_mood_and_maybe_archive(thread_id: str, intent: TaskIntent) -> None:
+    """mood tick + Q1/Q2 L3 归档（parser 与 solo_fast 共用）。"""
+    try:
+        mood_engine = get_mood_engine()
+        mood_engine.arm_interaction_hook(thread_id)
+        mood_engine.tick(thread_id)
+        mood_engine.reset_connection(thread_id)
+        mood_engine.apply_pain_signal(thread_id, intent.pain_level)
+    except Exception as e:
+        print(f"[MoodEngine] tick failed: {e}")
+
+    try:
+        quadrant = getattr(intent, "quadrant", None)
+        if quadrant in ["Q1", "Q2"]:
+            memory_db = get_memory_db()
+            memory_id = memory_db.save_memory(
+                thread_id=thread_id,
+                content=intent.raw_input,
+                quadrant=quadrant,
+            )
+            print(f"[archive] stored {quadrant} memory id={memory_id}")
+            db_path = memory_db.db_path
+            async_tasks.schedule(
+                enrichment.extract_and_store,
+                thread_id=thread_id,
+                source_memory_id=memory_id,
+                content=intent.raw_input,
+                db_path=db_path,
+            )
+            async_tasks.schedule(
+                enrichment.embed_and_store_memory,
+                memory_id=memory_id,
+                content=intent.raw_input,
+                db_path=db_path,
+            )
+    except Exception as e:
+        print(f"[Bit] memory write failed: {e}")
 
 
 def _simple_agent_reply(
@@ -136,7 +168,10 @@ def _simple_agent_reply(
     定制逻辑，单独实现，不复用这个通用壳。"""
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
     summary_block, fragment_block, cabinet_block = _memory_blocks_for_reply(
-        thread_id, include_fragments=include_fragments, persona=persona
+        thread_id,
+        include_fragments=include_fragments,
+        persona=persona,
+        turn_context=state.get("turn_context"),
     )
     human = compose_user_message(
         user_status,
@@ -157,6 +192,20 @@ def _simple_agent_reply(
 
 # 3. 节点实现 ───────────────────────────────────────────────────────
 
+def node_solo_fast(state: GraphState):
+    """Solo Bina：规则合成 intent，跳过 structured parser LLM。"""
+    print("-> [系统] Solo fast-path：跳过全量意图解析")
+    user_input = state["current_input"]
+    thread_id = state.get("thread_id", MAIN_THREAD_ID)
+    real_intent = synthesize_solo_bina_intent(user_input)
+    _tick_mood_and_maybe_archive(thread_id, real_intent)
+    print(
+        f"-> [审计] solo_fast: 痛感={real_intent.pain_level}, "
+        f"象限={real_intent.quadrant}, 人格=bina"
+    )
+    return {"intent": real_intent, "resolved_route_key": "emotion_route"}
+
+
 def node_parser(state: GraphState):
     """解析用户意图，并在需要时写入 Q1/Q2 级别的记忆"""
     print("-> [系统] 正在呼叫大模型进行意图解析...")
@@ -167,13 +216,16 @@ def node_parser(state: GraphState):
     history_lines = truncate_history_lines(recent_history) if recent_history else []
     history_text = "\n".join(history_lines) if history_lines else "无"
 
-    summary_text = "无"
-    try:
-        summary_block = format_summaries_block(get_memory_db(), thread_id)
-        if summary_block.strip():
-            summary_text = summary_block
-    except Exception as e:
-        print(f"⚠️ [memory] parser 摘要回注失败: {e}")
+    ctx = state.get("turn_context")
+    if ctx is None:
+        conv = state.get("conversation_id") or thread_id
+        ctx = build_turn_context(
+            conv,
+            recent_history,
+            memory_thread_id=thread_id,
+            prefetch_summary=True,
+        )
+    summary_text = ctx.summary_block.strip() if ctx.summary_block.strip() else "无"
 
     system_prompt = """你是一个任务认知路由引擎。
 你必须返回合法的 JSON 结构化结果，匹配 TaskIntent 协议。
@@ -239,41 +291,12 @@ def node_parser(state: GraphState):
         + (f", 强制={forced}" if forced else "")
     )
 
-    # 【状态引擎】：先算久别/首交互钩子，再 tick；钩子由后续人格 get_prompt_context 消费。
-    try:
-        mood_engine = get_mood_engine()
-        mood_engine.arm_interaction_hook(thread_id)
-        mood_engine.tick(thread_id)
-        mood_engine.apply_pain_signal(thread_id, real_intent.pain_level)
-    except Exception as e:
-        print(f"⚠️ [MoodEngine] 状态更新失败（不影响主流程）: {e}")
-
-    # 【记忆写入逻辑】：Q1/Q2 才落 L3；写入后异步触发细粒度提取 + 在线向量化。
-    try:
-        quadrant = getattr(real_intent, "quadrant", None)
-        if quadrant in ["Q1", "Q2"]:
-            memory_db = get_memory_db()
-            memory_id = memory_db.save_memory(
-                thread_id=thread_id,
-                content=real_intent.raw_input,
-                quadrant=quadrant,
-            )
-            print(f"📦 [归档]: 已将 {quadrant} 级别指令存入 L3 矩阵 (id={memory_id})。")
-            async_tasks.schedule(
-                enrichment.extract_and_store,
-                thread_id=thread_id,
-                source_memory_id=memory_id,
-                content=real_intent.raw_input,
-            )
-            async_tasks.schedule(
-                enrichment.embed_and_store_memory,
-                memory_id=memory_id,
-                content=real_intent.raw_input,
-            )
-    except Exception as e:
-        print(f"⚠️ [Bit 警报]: 记忆写入失败: {e}")
-
-    return {"intent": real_intent, "resolved_route_key": resolved_route_key}
+    _tick_mood_and_maybe_archive(thread_id, real_intent)
+    return {
+        "intent": real_intent,
+        "resolved_route_key": resolved_route_key,
+        "turn_context": ctx,
+    }
 
 
 def node_jean(state: GraphState):
@@ -282,12 +305,12 @@ def node_jean(state: GraphState):
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
     query = intent.raw_input
 
-    retriever = get_hybrid_retriever()
+    retriever = get_hybrid_retriever(get_memory_db().db_path)
     query_embedding = None
     try:
         query_embedding = get_embedding(query)
     except Exception as e:
-        print(f"⚠️ [Jean] embedding 获取失败，退化为仅关键词召回: {e}")
+        print(f"[Jean] embedding failed, keyword-only: {e}")
 
     try:
         docs = retriever.search_hybrid(
@@ -306,7 +329,7 @@ def node_jean(state: GraphState):
                 quadrant="Q2",
             )
     except Exception as e:
-        print(f"⚠️ [Jean] hybrid 检索失败，返回空材料: {e}")
+        print(f"[Jean] hybrid search failed: {e}")
         docs = []
 
     if docs:
@@ -435,24 +458,7 @@ def node_bina(state: GraphState):
     intent = state["intent"]
     thread_id = state.get("thread_id", MAIN_THREAD_ID)
 
-    hour = datetime.now().hour
-    is_working_hour = 10 <= hour < 18
-    visual_rule = (
-        "当前为【工作时间】。视觉限制：禁止使用颜文字、波浪号，保持干练但温暖。"
-        if is_working_hour
-        else "当前为【休息/深夜时间】。视觉解锁：允许并鼓励使用可爱颜文字(≧∇≦)，释放高能量！"
-    )
-    if 8 <= hour < 10:
-        mode_context = "单人密谈 · 晨间温和启动：自然唤醒，可给轻量生活提案，勿盘问进度。"
-    elif 12 <= hour < 14:
-        mode_context = "单人密谈 · 午餐闲聊：允许吐槽与八卦，优先情绪价值。"
-    elif 18 <= hour < 23:
-        mode_context = "单人密谈 · 晚间家庭模式：娱乐豁免，禁止把话题硬拽回学习 KPI。"
-    elif hour >= 23 or hour < 8:
-        mode_context = "单人密谈 · 深夜收尾：短回复、柔软陪伴；若陛下仍在硬肝，只给一次轻提醒。"
-    else:
-        mode_context = "单人密谈 · 日间陪伴：干练但亲密；先接住状态，再给够用的下一步。"
-
+    mode_context, visual_rule = build_bina_mode_context(proactive=False)
     medical_block = BINA_MEDICAL_REDLINE_BLOCK if intent.pain_level > 6 else ""
 
     bina_prompt = _persona_prompt(
@@ -466,13 +472,16 @@ def node_bina(state: GraphState):
     )
 
     summary_block, fragment_block, cabinet_block = _memory_blocks_for_reply(
-        thread_id, include_fragments=True, persona="bina"
+        thread_id,
+        include_fragments=True,
+        persona="bina",
+        turn_context=state.get("turn_context"),
     )
     user_status = compose_user_message(
         (
-            f"陛下当前情绪发泄/日常闲聊：{intent.raw_input}\n"
-            f"系统判定痛感评级：{intent.pain_level} / 10\n"
-            f"对话模式：{mode_context}"
+            f"陛下刚说：{intent.raw_input}\n"
+            f"（内部：痛感 {intent.pain_level}/10；{mode_context}。"
+            f"用短气泡接话，别写结构化安慰文，别主动给话术/热汤收尾。）"
         ),
         recent_history=state.get("recent_history", []),
         summary_block=summary_block,
@@ -486,6 +495,14 @@ def node_bina(state: GraphState):
         final_text = response.content
     except Exception as e:
         final_text = f"呜呜，陛下的情绪电波太强，Bina 的线路稍微短路了一下... (Error: {e})"
+
+    # 自拍/发图：ComfyUI + 定妆 LoRA（邻舍路径）；失败不吞文本回复
+    try:
+        from modules.image_gen.service import maybe_attach_selfie
+
+        final_text = maybe_attach_selfie("bina", intent.raw_input or "", str(final_text or ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[image_gen] bina selfie skipped: {exc}")
 
     return {"final_response": final_text, "active_task_type": "emotion", "active_persona": "bina"}
 
@@ -646,6 +663,7 @@ def node_debate(state: GraphState):
 # 4. 构建图 (Build the Graph)
 workflow = StateGraph(GraphState)
 
+workflow.add_node("solo_fast", node_solo_fast)
 workflow.add_node("parser", node_parser)
 workflow.add_node("emotion_agent", node_bina)
 workflow.add_node("jean_agent", node_jean)
@@ -661,7 +679,17 @@ workflow.add_node("qianjin_agent", node_qianjin)
 workflow.add_node("boming_agent", node_boming)
 workflow.add_node("debate_agent", node_debate)
 
-workflow.set_entry_point("parser")
+
+def _pick_entry(state: GraphState) -> str:
+    return "solo_fast" if state.get("solo_fast") else "parser"
+
+
+workflow.set_conditional_entry_point(
+    _pick_entry,
+    {"solo_fast": "solo_fast", "parser": "parser"},
+)
+
+workflow.add_edge("solo_fast", "emotion_agent")
 
 workflow.add_conditional_edges(
     "parser",

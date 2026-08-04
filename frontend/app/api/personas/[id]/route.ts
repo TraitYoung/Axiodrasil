@@ -10,7 +10,10 @@ export async function GET(
   const { id } = await ctx.params;
   const backendUrl = `${getBackendBaseUrl()}/api/v1/personas/${encodeURIComponent(id)}`;
   try {
-    const res = await fetch(backendUrl, { cache: "no-store" });
+    const res = await fetch(backendUrl, {
+      cache: "no-store",
+      signal: AbortSignal.timeout(8_000),
+    });
     const text = await res.text();
     return new NextResponse(text, {
       status: res.status,
@@ -18,6 +21,9 @@ export async function GET(
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return NextResponse.json({ detail: msg }, { status: 503 });
+    return NextResponse.json(
+      { detail: `无法加载角色卡（${backendUrl}）：${msg}` },
+      { status: 503 },
+    );
   }
 }

@@ -12,7 +12,11 @@ from typing import Any, Dict, List, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-from infrastructure.container import get_enrichment_extraction_llm, get_enrichment_llm
+from infrastructure.container import (
+    get_db_path,
+    get_enrichment_extraction_llm,
+    get_enrichment_llm,
+)
 from memory.database import PersonaMemory
 from schemas.memory import MemoryExtraction
 from tools.ai_client import get_embedding
@@ -22,7 +26,7 @@ def extract_and_store(
     thread_id: str,
     source_memory_id: int,
     content: str,
-    db_path: str = "./data/axiodrasil_core.db",
+    db_path: str | None = None,
 ) -> None:
     """从一条 Q1/Q2 原始记忆中提取事实/偏好/情绪碎片 + 实体，写入
     memory_fragments / memory_fragment_embeddings / entities。
@@ -30,12 +34,13 @@ def extract_and_store(
     设计为「失败不影响主流程」：任何一步异常只打印日志并 return，因为这个
     函数总是在后台任务里跑，调用方早已把响应还给用户了。
     """
+    path = db_path or get_db_path()
     extraction_llm = get_enrichment_extraction_llm()
     if extraction_llm is None:
         print("[enrichment] 未配置聊天 LLM API Key，跳过细粒度提取。")
         return
 
-    memory_db = PersonaMemory(db_path=db_path)
+    memory_db = PersonaMemory(db_path=path)
 
     try:
         result: MemoryExtraction = extraction_llm.invoke(
@@ -92,12 +97,12 @@ def extract_and_store(
 def embed_and_store_memory(
     memory_id: int,
     content: str,
-    db_path: str = "./data/axiodrasil_core.db",
+    db_path: str | None = None,
 ) -> None:
     """在线为一条 matrix 记忆写 embedding，避免仅依赖 scripts/migration.py 冷启动。"""
     if not content or not str(content).strip():
         return
-    memory_db = PersonaMemory(db_path=db_path)
+    memory_db = PersonaMemory(db_path=db_path or get_db_path())
     try:
         embedding = get_embedding(content)
         memory_db.save_memory_embedding(memory_id, embedding.tobytes())
@@ -108,7 +113,7 @@ def embed_and_store_memory(
 def generate_rolling_summary(
     thread_id: str,
     turns: List[Dict[str, Any]],
-    db_path: str = "./data/axiodrasil_core.db",
+    db_path: str | None = None,
 ) -> None:
     """把最近若干轮（来自 Redis 会话热缓存）压成一段摘要，写入 memory_summaries。
 
@@ -142,7 +147,7 @@ def generate_rolling_summary(
         print(f"[enrichment] 滚动摘要生成失败: {e}")
         return
 
-    memory_db = PersonaMemory(db_path=db_path)
+    memory_db = PersonaMemory(db_path=db_path or get_db_path())
     start_ts = str(turns[0].get("ts", ""))
     end_ts = str(turns[-1].get("ts", ""))
     memory_db.save_summary(

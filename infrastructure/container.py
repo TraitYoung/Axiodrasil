@@ -18,14 +18,26 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_PROJECT_ROOT / ".env")
 
 # ── 配置读取 ──────────────────────────────────────────
+# 兼容误写成 LLM_API_KEY / LLM_BASE_URL / LLM_MODEL 的 .env（其它工具链命名）
 _LLM_PROVIDER = (os.getenv("AX_LLM_PROVIDER") or "deepseek").strip().lower()
-_CHAT_MODEL = os.getenv("AX_CHAT_MODEL") or (
-    "deepseek-v4-flash" if _LLM_PROVIDER == "deepseek" else "qwen-plus"
+_CHAT_MODEL = (
+    os.getenv("AX_CHAT_MODEL")
+    or os.getenv("LLM_MODEL")
+    or ("deepseek-v4-flash" if _LLM_PROVIDER == "deepseek" else "qwen-plus")
 )
 _ENRICHMENT_MODEL = os.getenv("AX_ENRICHMENT_MODEL") or _CHAT_MODEL
 
-_DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY") or ""
-_DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+_DEEPSEEK_API_KEY = (
+    os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY") or ""
+).strip()
+_DEEPSEEK_BASE_URL = (
+    os.getenv("DEEPSEEK_BASE_URL")
+    or os.getenv("LLM_BASE_URL")
+    or "https://api.deepseek.com"
+).strip()
+if _DEEPSEEK_BASE_URL.rstrip("/").endswith("/v1"):
+    # ChatOpenAI 会自己拼 /chat/completions；根地址不要带 /v1
+    _DEEPSEEK_BASE_URL = _DEEPSEEK_BASE_URL.rstrip("/")[:-3] or "https://api.deepseek.com"
 _DEEPSEEK_THINKING = os.getenv("AX_DEEPSEEK_THINKING", "0").strip().lower() not in (
     "0",
     "false",
@@ -33,13 +45,16 @@ _DEEPSEEK_THINKING = os.getenv("AX_DEEPSEEK_THINKING", "0").strip().lower() not 
     "",
 )
 
-_QWEN_API_KEY = os.getenv("QWEN_API_KEY") or ""
+_QWEN_API_KEY = (os.getenv("QWEN_API_KEY") or "").strip()
 _QWEN_BASE_URL = os.getenv(
     "QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
 )
 
 _SUMMARY_EVERY_N_TURNS = int(os.getenv("AX_SUMMARY_EVERY_N_TURNS", "20"))
-_DB_PATH = str(_PROJECT_ROOT / "data" / "axiodrasil_core.db")
+# 启动器会设 AX_DB_PATH 到 Windows 本地盘；勿落到 \\wsl$\... 否则 SQLite 易锁死数秒
+_DB_PATH = (os.getenv("AX_DB_PATH") or "").strip() or str(
+    _PROJECT_ROOT / "data" / "axiodrasil_core.db"
+)
 
 
 # ── 延迟初始化的单例 ──────────────────────────────────
@@ -69,7 +84,7 @@ def _chat_openai_kwargs(model: str) -> dict[str, Any]:
     api_key, base_url = _chat_credentials()
     if not api_key:
         label = "DEEPSEEK_API_KEY" if _LLM_PROVIDER == "deepseek" else "QWEN_API_KEY"
-        print(f"⚠️ 未检测到 {label}，LLM 调用将在首次 invoke 时报错。请检查 .env 文件！")
+        print(f"[llm] missing {label}; first invoke will fail. Check .env")
     kwargs: dict[str, Any] = {
         "model": model,
         "api_key": api_key or "missing-key-will-fail-on-invoke",

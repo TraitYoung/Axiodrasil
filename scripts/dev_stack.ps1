@@ -18,6 +18,11 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $StateDir = Join-Path $ProjectRoot ".devstack"
 $LogDir = Join-Path $StateDir "logs"
 $PidFile = Join-Path $StateDir "pids.json"
+# 与启动器一致：Windows 本地库，避免落在 WSL UNC 路径导致 SQLite 卡死
+$DefaultDbPath = Join-Path $env:USERPROFILE ".axiodrasil\axiodrasil_core.db"
+if ([string]::IsNullOrWhiteSpace($env:AX_DB_PATH)) {
+    $env:AX_DB_PATH = $DefaultDbPath
+}
 
 $Services = @{
     redis = @{
@@ -123,34 +128,63 @@ function Resolve-Targets {
     return $Service
 }
 
+function Get-WslInfo([string]$windowsPath) {
+    # \\wsl.localhost\Ubuntu-24.04\home\admin\Axiodrasil -> distro + /home/admin/Axiodrasil
+    if ($windowsPath -match '^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)\\(.+)$') {
+        $rest = ($Matches[2] -replace '\\', '/').TrimStart('/')
+        return @{ Distro = $Matches[1]; LinuxPath = "/$rest" }
+    }
+    return $null
+}
+
+function Wait-PortListen([int]$Port, [int]$TimeoutSec = 90) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $listen = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+        if ($listen.Count -gt 0) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 function Start-One([string]$name, [hashtable]$pids) {
     $svc = $Services[$name]
     if ($null -eq $svc) { throw "Unknown service: $name" }
 
-    $existingPid = 0
-    if ($pids.ContainsKey($name)) {
-        $existingPid = [int]$pids[$name]
-        if ($existingPid -gt 0 -and (Is-ProcessAlive -ProcId $existingPid)) {
-            Write-Host "[$name] already running (PID=$existingPid)"
-            return
-        }
-    }
-
+    # 以端口为准，避免外壳进程还在但服务已挂时误判「已启动」
     $portPids = @(Get-PortPids -Port $svc.Port)
     if ($portPids.Count -gt 0) {
-        if ($ForceKillPort) {
-            Stop-ByPort -Port $svc.Port
-        } else {
-            Write-Warning "[$name] port $($svc.Port) already occupied by PID(s): $($portPids -join ', ')"
-            Write-Warning "Use -ForceKillPort to clear port automatically."
+        Write-Host "[$name] already running on port $($svc.Port) (PID(s): $($portPids -join ', '))"
+        return
+    }
+
+    # 项目在 WSL UNC 时：Windows npm/cmd 无法作当前目录，前端必须走 WSL+nvm
+    if ($name -eq "frontend") {
+        $wsl = Get-WslInfo -windowsPath $ProjectRoot
+        if ($null -ne $wsl) {
+            $linuxFe = "$($wsl.LinuxPath)/frontend"
+            $inner = "pkill -f next-server 2>/dev/null || true; pkill -f 'next dev' 2>/dev/null || true; cd '$linuxFe' && npm run dev -- --hostname 127.0.0.1 --port $($svc.Port)"
+            $psCmd = "wsl -d '$($wsl.Distro)' -- bash -lic `"$inner`""
+            $proc = Start-Process -FilePath "powershell" -ArgumentList @("-NoProfile", "-Command", $psCmd) -PassThru -WindowStyle Minimized
+            $pids[$name] = $proc.Id
+            Write-Host "[$name] started via WSL $($wsl.Distro) (PID=$($proc.Id), port=$($svc.Port))"
             return
         }
     }
 
-    $psCmd = @(
-        "Set-Location '$($svc.Cwd)'",
-        "$($svc.Command)"
-    ) -join "; "
+    $psCmdParts = @("Set-Location -LiteralPath '$($svc.Cwd)'")
+    if ($name -eq "backend") {
+        $dbEsc = $env:AX_DB_PATH.Replace("'", "''")
+        $psCmdParts = @(
+            "`$env:AX_DB_PATH = '$dbEsc'",
+            "Set-Location -LiteralPath '$($svc.Cwd)'",
+            "$($svc.Command)"
+        )
+        Write-Host "[$name] AX_DB_PATH=$($env:AX_DB_PATH)"
+    } else {
+        $psCmdParts += "$($svc.Command)"
+    }
+    $psCmd = $psCmdParts -join "; "
     $proc = Start-Process -FilePath "powershell" -ArgumentList @("-NoProfile", "-Command", $psCmd) -PassThru -WindowStyle Minimized
     $pids[$name] = $proc.Id
     Write-Host "[$name] started (PID=$($proc.Id), port=$($svc.Port))"
@@ -212,13 +246,23 @@ function Start-Targets {
     }
     Write-Pids -map $pids
 
+    $targets = Resolve-Targets
+    if ($targets -contains "frontend" -or $All) {
+        if (-not (Wait-PortListen -Port 3000 -TimeoutSec 90)) {
+            Write-Warning "前端端口 3000 未就绪。项目在 WSL 路径时请确认 WSL 内已装 Node（nvm）。"
+        }
+    }
+    if ($targets -contains "backend" -or $All) {
+        if (-not (Wait-PortListen -Port 8000 -TimeoutSec 45)) {
+            Write-Warning "后端端口 8000 未就绪，请查看 .devstack/logs/backend.log"
+        }
+    }
+
     if ($OpenBrowser -or $script:OpenBrowserFromMenu) {
-        $targets = Resolve-Targets
         if ($targets -contains "frontend" -or $All) {
             try {
-                Start-Sleep -Milliseconds 500
-                Start-Process "http://127.0.0.1:3000"
-                Write-Host "Opened browser: http://127.0.0.1:3000"
+                Start-Process "http://127.0.0.1:3000/solo"
+                Write-Host "Opened browser: http://127.0.0.1:3000/solo"
             } catch {
                 Write-Warning "Failed to open browser automatically: $($_.Exception.Message)"
             }

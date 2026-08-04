@@ -23,6 +23,11 @@ class HybridRetriever:
         self.k = k  # RRF 常数，防止长尾放大
         self._persona_memory = PersonaMemory(db_path=db_path)  # 复用实体表 + 解密逻辑
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=1.0)
+        conn.execute("PRAGMA busy_timeout=1000")
+        return conn
+
     # --------- 路 3：实体聚合召回 ---------
     def _get_entity_scores(
         self,
@@ -39,7 +44,7 @@ class HybridRetriever:
         try:
             return self._persona_memory.find_entity_memory_ids(thread_id, query, top_n=top_n)
         except Exception as e:
-            print(f"⚠️ [HybridRetriever] 实体召回失败，跳过第三路: {e}")
+            print(f"[HybridRetriever] entity recall failed: {e}")
             return []
 
     # --------- 路 1：FTS5 关键词检索 ---------
@@ -83,7 +88,7 @@ class HybridRetriever:
         """
         params.append(top_n)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.execute(sql, params)
             rows = cursor.fetchall()
 
@@ -128,7 +133,7 @@ class HybridRetriever:
             base_sql += " AND m.quadrant = ?"
             params.append(quadrant)
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.execute(base_sql, params)
             rows = cursor.fetchall()
 
@@ -246,7 +251,7 @@ class HybridRetriever:
         WHERE id IN ({placeholders})
         """
 
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cursor = conn.execute(sql, top_ids)
             rows = cursor.fetchall()
 
@@ -275,10 +280,13 @@ class HybridRetriever:
 _hybrid_retriever: Optional["HybridRetriever"] = None
 
 
-def get_hybrid_retriever(db_path: str = "./data/axiodrasil_core.db") -> "HybridRetriever":
+def get_hybrid_retriever(db_path: str | None = None) -> "HybridRetriever":
+    from infrastructure.container import get_db_path
+
+    path = db_path or get_db_path()
     global _hybrid_retriever
-    if _hybrid_retriever is None or _hybrid_retriever.db_path != db_path:
-        _hybrid_retriever = HybridRetriever(db_path=db_path)
+    if _hybrid_retriever is None or _hybrid_retriever.db_path != path:
+        _hybrid_retriever = HybridRetriever(db_path=path)
     return _hybrid_retriever
 
 

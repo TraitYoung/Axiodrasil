@@ -15,6 +15,7 @@ Axiodrasil is a **multi-agent routing + memory kernel** system for high-pressure
 | `app/matrix/` | Port 契约：`HealthPort` / `SessionPort` / `ChatPort` / `PersonaPort` / `CabinetPort` / `TracePort` |
 | `app/registry.py` | 模块注册表；`bootstrap_registry()` 装配默认适配器 |
 | `infra/` | 薄封装 → `infrastructure.container`（LLM / DB / Redis） |
+| `observability/` | 轻量 `obs()` stub（proactive 等）；完整 JSONL 管线可选 |
 | `modules/personas/` | 角色卡 catalog（`GET /api/v1/personas`） |
 | `modules/chat_api/` | Chat / Health / Trace 适配外壳 |
 | `modules/cabinet_memory/` | 散会共识适配 |
@@ -47,29 +48,33 @@ The system persona is an "imperial cabinet" (BIOS V17.0) with 11 named character
 # REDIS_URL=redis://localhost:6379/0
 # Optional: JINA_API_KEY, RERANK_PROVIDER, RERANK_MODEL, RERANK_API_URL, RERANK_DISABLED
 # Optional: AX_DEEPSEEK_THINKING=0|1
+# Recommended: AX_DB_PATH=%USERPROFILE%\.axiodrasil\axiodrasil_core.db
 
 pip install -r requirements.txt
 cd frontend; npm install; cd ..
 ```
 
+**SQLite 路径**：`AX_DB_PATH` 统一聊天历史 / mood / enrichment / hybrid。启动器与 `scripts/dev_stack.ps1` 默认指向 `%USERPROFILE%\.axiodrasil\axiodrasil_core.db`；勿在 WSL UNC 上跑默认 `data/`（易锁死）。
+
 SillyTavern Group Chat：见 `docs/SillyTavern_Integration.md`；角色卡在 `sillytavern/character_card/group/`。
 
 ### Starting the Dev Stack
-Use the PowerShell orchestrator (recommended):
-```powershell
-.\scripts\dev_stack.ps1 -Action start -All -OpenBrowser
-.\scripts\dev_stack.ps1 -Action stop -All
-.\scripts\dev_stack.ps1 -Action status -All
-```
+**推荐（Linux / WSL Ubuntu 全栈，勿跨 Windows）**：
+```bash
+# 首次配置依赖
+cd ~/Axiodrasil
+./scripts/setup_linux_env.sh
 
-Or the GUI launcher (CustomTkinter；可打包 exe)：
-```powershell
-pip install -r launcher/requirements-launcher.txt
-python -m launcher
-# 打包：
-.\launcher\build_exe.ps1
+# 日常
+./start.sh          # redis + backend:8000 + frontend:3000
+./stop.sh
+./scripts/dev_stack.sh status
 ```
-打开浏览器后默认进入 `/solo`（Bina 单聊）。若找不到项目根，设置 `AX_PROJECT_ROOT` 为仓库根路径。
+浏览器打开 http://127.0.0.1:3000/solo（WSL2 与 Windows 共享 localhost）。
+
+> 根目录 `一键启动.cmd` / `一键停止.cmd` 仅作提示，日常请在 Ubuntu 终端用 `./start.sh`。
+
+遗留 Windows 编排（不推荐）：`scripts/dev_stack.ps1`、`python -m launcher`。
 
 Or manually in 3 terminals:
 ```powershell
@@ -147,12 +152,15 @@ User Input → FastAPI (main.py) → SessionCache (Redis, 5-turn sliding window)
 - **Cabinet M1/M2/M3** (`memory/cabinet_layers.py`): shared debate buffer / persona-private fragments / consensus after `散会` or `POST /api/v1/cabinet/consensus`
 - **Enrichment pipeline**: Q1/Q2 memories trigger async `extract_and_store` → fragments (fact/preference/emotion) + entity registration; preference/fact fragments injected on emotion/闲聊 paths (Bina/Tianji/Fukucho/Qianjin)
 - **Interaction hooks**: MoodEngine `arm_interaction_hook` before `tick` — reunion (>2h) / daily-first greetings (`AX_INTERACTION_HOOKS_ENABLED`)
+- **Proactive contact（托盘常驻）**: 后端 lifespan 心跳调用 `tick_idle` + `check_triggers`；阈值触达时以 Bina 写入最近活跃会话（`POST /api/v1/presence`），托盘轮询 `GET /api/v1/proactive/pending` 弹 Windows 通知（`AX_PROACTIVE_*`）
 - **LLM**: default DeepSeek `deepseek-v4-flash` (`AX_LLM_PROVIDER=deepseek`); embeddings still DashScope via `QWEN_API_KEY`
 - **SillyTavern Group Chat**: force persona via `x-persona` / `axiodrasil-<id>` model / `[AX_PERSONA:id]`; see `docs/SillyTavern_Integration.md`
 
 **Hybrid RAG** (`hybrid_engine.py`): 3-way recall (FTS5 BM25 + cosine vector + entity string match) → RRF fusion → optional external rerank (Jina/SiliconFlow). Used primarily by Jean node for Q2 document retrieval.
 
-**Mood engine** (`state/mood_engine.py`): 5-axis numerical drift (connection, pride, valence, arousal, immersion) persisted per `thread_id` in SQLite. Ticked once per `node_parser` call. Translated to natural language via `get_prompt_context()` / `get_style_guidance()` and injected into every persona's system prompt.
+**Mood engine** (`state/mood_engine.py`): 5-axis numerical drift (connection, pride, valence, arousal, immersion) persisted per `thread_id` in SQLite. User turns call `tick` + `reset_connection`; idle heartbeat uses `tick_idle` / `check_triggers` (`agents/proactive.py`). Translated to natural language via `get_prompt_context()` / `get_style_guidance()` and injected into every persona's system prompt.
+
+**Style steering**（正/负向提示，`prompts/steering.py`）：在人格 system prompt 末尾注入「尽量做到 / 坚决避免」。默认读 `prompts/steering/{persona}.json`，可用 `AX_{PERSONA}_POSITIVE_PROMPT` / `AX_{PERSONA}_NEGATIVE_PROMPT` 覆盖。经 `_persona_prompt` 对所有节点生效。
 
 **Workflow mode** (`agents/workflow_pipelines.py`): Alternative to cabinet routing — 4-step agile SE pipeline (discovery → sprint design → code sketch → delivery review), each step uses structured output and only passes JSON summary to next step to control token budget. Invoked when `workflow_mode="dev_pipeline"`.
 
@@ -161,12 +169,19 @@ User Input → FastAPI (main.py) → SessionCache (Redis, 5-turn sliding window)
 | Method | Path | Purpose |
 |--------|------|---------|
 | POST | `/api/v1/chat` | Synchronous chat, returns full response |
-| POST | `/api/v1/chat/stream` | SSE streaming chat (pseudo-streaming) |
+| POST | `/api/v1/chat/stream` | SSE **pseudo-streaming**（整轮完成后再切块；期间发 heartbeat） |
 | POST | `/api/v1/chat/export` | Export session to `output/chats/*.jsonl` |
 | GET | `/api/v1/chat/history` | Get recent turns for session |
-| GET | `/api/v1/health` | Health probe (no LLM call) |
+| GET | `/api/v1/health` | Health probe (no LLM call；Redis 熔断) |
 | GET | `/api/v1/personas` | Persona / character-card catalog |
 | GET | `/api/v1/personas/{id}` | Single persona card |
+| POST | `/api/v1/presence` | Solo 上报活跃会话（主动开口落点） |
+| GET | `/api/v1/proactive/pending` | 托盘拉取未读主动消息 |
+| POST | `/api/v1/attachments/ingest` | Solo 附件消化：文本抽取 / 图片 VL 描述 → 文本 |
+| POST | `/api/v1/stt` | 服务端语音转写（Web Speech 回退；需 `QWEN_API_KEY`） |
+| POST | `/api/v1/images/generate` | ComfyUI + 定妆 LoRA 出图（Bina 自拍等） |
+| GET | `/api/v1/images/file/{name}` | 读取已生成图片 |
+| GET | `/api/v1/images/persona/{id}` | 查看人格定妆配置摘要 |
 | POST | `/api/v1/cabinet/consensus` | Compress M1 debate → M3 consensus |
 | GET | `/v1/models` | OpenAI-compat model list (cabinet + 12 personas) |
 | POST | `/v1/chat/completions` | OpenAI-compat chat (SillyTavern Group Chat) |
@@ -190,9 +205,22 @@ Rolling summary frequency: `AX_SUMMARY_EVERY_N_TURNS` (default "20").
 
 Enrichment model: `AX_ENRICHMENT_MODEL` (default "qwen-turbo", cheaper than main "qwen-plus").
 
+Solo 附件/语音：图片描述 `AX_VL_MODEL`（默认 `qwen-vl-plus`）、服务端 STT `AX_STT_MODEL`（默认 `qwen2-audio-instruct`），均复用 `QWEN_API_KEY`。前端优先浏览器 Web Speech，失败再走 `/api/v1/stt`；附件经 ingest 后拼进 `chat` 的 `text`（不改 L1 schema）。
+
+Bina 定妆出图：本地 ComfyUI（`AX_COMFYUI_URL`）+ `config/persona_visual/bina.json` 的 LoRA；要自拍时 `node_bina` 调用出图并拼 markdown。详见 `docs/Bina_Image_Gen.md`。
+
 ### Tracing
 
 `tracing/router_run.py` wraps LangGraph `stream_mode="updates"` to collect per-node state deltas and insert a synthetic `__router__` step after `parser`. Every API call returns trace steps with timing, keys written, and summaries.
+
+### Reliability notes（已知边界）
+
+- **Solo 减负**：`forced_persona=bina` + `group_mode=false` 走 `solo_fast`（跳过全量 parser LLM，规则估痛感）；主入口为同步 `POST /api/v1/chat`（Next rewrite），伪 SSE 仅兼容。
+- **无真 token 流式**：`/api/v1/chat/stream` 仍为伪切块 + heartbeat；不存在 `agents/stream_turn.py`。
+- **前端本机收口**：`npm run dev` 绑 `127.0.0.1`；`/api/v1/*` rewrite 到 FastAPI。
+- **单聊主入口**：`/solo`；多会话 UI / 群聊为软归档或未接线，勿假设已实现。
+- **请求路径日志**：勿在 Windows GBK 控制台 `print` emoji，否则可把可恢复错误打成 500。
+- **回合入口**：`modules/chat_api/service.py` `TurnService`（ChatAdapter 不得再 import main）。
 
 ### Optional Encryption
 

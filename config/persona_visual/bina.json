@@ -1,0 +1,17 @@
+{
+  "persona_id": "bina",
+  "display_name": "Bina",
+  "enabled": true,
+  "loras": [
+    {
+      "path": "bina.safetensors",
+      "weight": 0.85,
+      "trigger_word": "bina_char"
+    }
+  ],
+  "appearance_prompt": "1girl, solo, young woman, soft lavender hair, shoulder-length wavy hair, amber eyes, gentle smile, light makeup, cute secretary vibe, neat blouse",
+  "negative_prompt": "lowres, blurry, deformed, bad anatomy, extra fingers, watermark, text, logo, multiple people, male, child",
+  "style_prompt": "anime illustration, clean lineart, soft lighting, high detail face",
+  "selfie_prompt": "selfie, looking at viewer, phone camera angle, upper body, indoor, natural light, candid",
+  "notes": "将训好的 Bina LoRA 放到 ComfyUI/models/loras/，文件名与 path 一致；trigger_word 必须与训练时一致。"
+}

@@ -1,15 +1,12 @@
 """
 Mood / 状态引擎（内阁共享的动态状态层）。
 
-移植自开源项目「积温 (jiwen)」的五轴数值漂移思路，但做了两点改造以适配内阁场景：
+移植自开源项目「积温 (jiwen)」的五轴数值漂移思路：
 
-1. 内阁是被动响应式的多助理系统，没有独立的主动消息通道，所以不移植积温的
-   `tick()` 触发数组（contact / find_activity / observation）；只保留数值漂移 +
-   自然语言翻译（`get_prompt_context` / `get_style_guidance`），供各人格节点在
-   生成回复前注入 system prompt。
-2. 情绪信号直接对接内阁已有的 `TaskIntent.pain_level`，不需要再跑一次 LLM 做
-   情绪分类；时段维度对接 BIOS Module 0.4 的作息表（Morning/Focus/Refuel/
-   Free Soul/Shutdown），驱动 immersion 与语气基调。
+1. 被动回合：`tick()` + `reset_connection()`（用户来了）注入 system prompt。
+2. 主动通道：`tick_idle()` + `check_triggers()` 供后台心跳；阈值触达时由
+   `agents/proactive.py` 生成 Bina 短讯（托盘常驻场景）。
+3. 情绪信号对接 `TaskIntent.pain_level`；时段对接 BIOS Module 0.4 作息表。
 
 五轴（沿用积温命名）：
 - connection  [0, 1]   连接需求：多久没交互了，想念感累积
@@ -18,8 +15,7 @@ Mood / 状态引擎（内阁共享的动态状态层）。
 - arousal     [-1, 1]  唤醒度（正交于 valence）
 - immersion   [0, 1]   沉浸度：当前专注/忙碌程度
 
-数值只做数学漂移，不调用任何模型；每次 `node_parser` 收到新一轮用户输入时
-`tick()` 一次，状态按 `thread_id` 持久化在 SQLite 单行表 `mood_state`。
+数值只做数学漂移，不调用任何模型；状态按 `thread_id` 持久化在 SQLite。
 """
 
 from __future__ import annotations
@@ -92,6 +88,12 @@ _AROUSAL_DECAY_PER_MIN = 0.005
 _IMMERSION_DECAY_PER_MIN = 0.01
 _MAX_TICK_MINUTES = 240.0  # 超过 4 小时按 4 小时算，避免久别重逢时数值瞬间打满
 
+# 积温简化阈值（可用环境变量微调）
+_TRIGGER_OBSERVATION = float(os.getenv("AX_MOOD_OBS_THRESHOLD", "0.20"))
+_TRIGGER_CONSIDER = float(os.getenv("AX_MOOD_CONTACT_THRESHOLD", "0.35"))
+_TRIGGER_FORCE = float(os.getenv("AX_MOOD_FORCE_CONTACT_THRESHOLD", "0.50"))
+_TRIGGER_PRIDE_BLOCK = float(os.getenv("AX_MOOD_PRIDE_BLOCK", "0.50"))
+
 
 class MoodEngine:
     """跨人格共享的状态引擎；状态以 thread_id 为粒度持久化在 SQLite。"""
@@ -103,8 +105,13 @@ class MoodEngine:
         # 本轮 tick 前算出的交互钩子，供 get_prompt_context 消费一次
         self._pending_hooks: Dict[str, str] = {}
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=1.0)
+        conn.execute("PRAGMA busy_timeout=1000")
+        return conn
+
     def _init_db(self) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS mood_state (
@@ -122,7 +129,7 @@ class MoodEngine:
 
     # ---------- 基础读写 ----------
     def _load(self, thread_id: str) -> MoodState:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             cur = conn.execute(
                 """
                 SELECT thread_id, connection, pride, valence, arousal, immersion, last_tick_at
@@ -144,7 +151,7 @@ class MoodEngine:
         )
 
     def _save(self, state: MoodState) -> None:
-        with sqlite3.connect(self.db_path) as conn:
+        with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO mood_state (thread_id, connection, pride, valence, arousal, immersion, last_tick_at)
@@ -213,11 +220,8 @@ class MoodEngine:
         return hook
 
     # ---------- 漂移 ----------
-    def tick(self, thread_id: str, now: Optional[datetime] = None) -> MoodState:
-        """
-        推进数值漂移。用「距上次 tick 的分钟数」做时间步长；用户主动发来
-        消息本身就代表"连接需求被满足"，所以漂移完成后会顺带重置 connection。
-        """
+    def _drift(self, thread_id: str, now: Optional[datetime] = None) -> MoodState:
+        """仅推进数值漂移并更新 last_tick_at，不缓解 connection。"""
         now = now or datetime.now()
         state = self._load(thread_id)
 
@@ -236,16 +240,47 @@ class MoodEngine:
         state.valence = _decay_toward_zero(state.valence, _VALENCE_DECAY_PER_MIN, minutes)
         state.arousal = _decay_toward_zero(state.arousal, _AROUSAL_DECAY_PER_MIN, minutes)
 
-        # focus 时段沉浸度衰减更慢（正在专注干活），free_soul/shutdown 衰减更快
-        immersion_multiplier = 0.5 if period_key == "focus" else 1.5 if period_key in ("free_soul", "shutdown") else 1.0
-        state.immersion = _clamp(state.immersion - _IMMERSION_DECAY_PER_MIN * immersion_multiplier * minutes, 0.0, 1.0)
+        immersion_multiplier = (
+            0.5 if period_key == "focus" else 1.5 if period_key in ("free_soul", "shutdown") else 1.0
+        )
+        state.immersion = _clamp(
+            state.immersion - _IMMERSION_DECAY_PER_MIN * immersion_multiplier * minutes,
+            0.0,
+            1.0,
+        )
 
         state.last_tick_at = now.isoformat()
         self._save(state)
-
-        # 用户已经来了，连接需求部分缓解（不完全归零，模拟"见到人但话还没说完"）
-        self.apply_delta(thread_id, connection=-0.35)
         return self._load(thread_id)
+
+    def tick(self, thread_id: str, now: Optional[datetime] = None) -> MoodState:
+        """用户回合：推进漂移。调用方应在用户真正回复后另调 `reset_connection()`。"""
+        return self._drift(thread_id, now=now)
+
+    def tick_idle(self, thread_id: str, now: Optional[datetime] = None) -> MoodState:
+        """空闲心跳：只漂移，不缓解连接需求（用于主动开口判定）。
+
+        尚无 last_tick_at 时只打时间戳，避免按 240 分钟上限瞬间顶满 connection。
+        """
+        now = now or datetime.now()
+        state = self._load(thread_id)
+        if not state.last_tick_at:
+            state.last_tick_at = now.isoformat()
+            self._save(state)
+            return self._load(thread_id)
+        return self._drift(thread_id, now=now)
+
+    def check_triggers(self, thread_id: str) -> List[str]:
+        """按积温简化阈值返回触发动作（可能含 observation / contact）。"""
+        state = self._load(thread_id)
+        triggers: List[str] = []
+        if state.connection >= _TRIGGER_OBSERVATION:
+            triggers.append("observation")
+        if state.connection >= _TRIGGER_FORCE:
+            triggers.append("contact")
+        elif state.connection >= _TRIGGER_CONSIDER and state.pride < _TRIGGER_PRIDE_BLOCK:
+            triggers.append("contact")
+        return triggers
 
     def apply_pain_signal(self, thread_id: str, pain_level: int) -> MoodState:
         """把内阁已有的 pain_level（1-10）映射为 valence/arousal 的一次性扰动，

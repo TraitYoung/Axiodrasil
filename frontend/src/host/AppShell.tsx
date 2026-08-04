@@ -32,10 +32,8 @@ export function AppShell({
                 <Link
                   key={item.href}
                   href={item.href}
-                  className={`rounded-full px-4 py-1.5 text-sm transition ${
-                    active
-                      ? "bg-[var(--ax-accent)] text-[var(--ax-accent-fg)]"
-                      : "text-[var(--ax-muted)] hover:text-[var(--ax-fg)]"
+                  className={`ax-nav-pill rounded-full px-4 py-1.5 text-sm transition ${
+                    active ? "ax-nav-pill--active" : "text-[var(--ax-muted)] hover:text-[var(--ax-fg)]"
                   }`}
                 >
                   {item.label}

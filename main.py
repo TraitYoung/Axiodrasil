@@ -3,45 +3,66 @@ import hashlib
 import re
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Literal, Optional
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from agents.persona_meta import PERSONA_META, PERSONA_TO_ROUTE, SUMMON_ALIASES
-from agents.router import app as router_graph
-from agents.workflow_pipelines import run_dev_pipeline, synthetic_intent_for_workflow
-from infrastructure.container import get_chat_model, get_llm, get_llm_provider, get_memory_db
-from memory import async_tasks
-from memory.cabinet_layers import (
-    append_debate_exchange,
-    close_and_compress,
-    detect_consensus_close,
-    extract_persona_private,
+from agents.proactive import (
+    drain_pending,
+    get_presence,
+    set_persist_turn,
+    set_presence,
+    start_proactive_loop,
+    stop_proactive_loop,
 )
-from memory.session_cache import SessionCache
-from memory.summary_service import maybe_trigger_rolling_summary
+from infrastructure.container import get_chat_model, get_llm_provider
+from memory.cabinet_layers import close_and_compress
+from modules.chat_api.service import (
+    TurnRequest,
+    get_shared_session_cache,
+    get_turn_service,
+    resolve_group_mode,
+)
 from schemas.protocols import TaskIntent
 from schemas.trace import TraceStep
-from tracing.router_run import run_router_traced
 
-app = FastAPI(title="Axiodrasil Core API", version="1.0.0")
 
-session_cache = SessionCache(ttl_seconds=3600, window_size=5)
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    set_persist_turn(_persist_turn)
+    await start_proactive_loop()
+    try:
+        yield
+    finally:
+        await stop_proactive_loop()
 
-# Host 接口矩阵：装配适配器并挂载功能模块路由（personas catalog 等）
+
+app = FastAPI(title="Axiodrasil Core API", version="1.0.0", lifespan=_lifespan)
+
+session_cache = get_shared_session_cache()
+turn_service = get_turn_service()
+
+# Host 接口矩阵：personas 与 bootstrap 解耦，避免矩阵失败导致角色卡 404 / 前端永久接通中
+try:
+    from modules.personas.routes import router as personas_router
+
+    app.include_router(personas_router)
+except Exception as _personas_exc:  # pragma: no cover
+    print(f"[host] personas router mount failed: {_personas_exc}")
+
 try:
     from app.registry import bootstrap_registry, get_registry
-    from modules.personas.routes import router as personas_router
 
     bootstrap_registry()
     app.state.matrix = get_registry()  # type: ignore[attr-defined]
-    app.include_router(personas_router)
 except Exception as _matrix_exc:  # pragma: no cover
-    print(f"⚠️ [host] 接口矩阵装配失败: {_matrix_exc}")
+    print(f"[host] matrix bootstrap failed: {_matrix_exc}")
 
 _AX_PERSONA_TAG_RE = re.compile(r"\[AX_PERSONA:([a-zA-Z]+)\]", re.IGNORECASE)
 _MODEL_PERSONA_RE = re.compile(
@@ -93,65 +114,250 @@ def _resolve_forced_persona(
     )
 
 
-def _load_recent_history(session_id: str, limit: int = 5) -> list[str]:
-    """优先 Redis 热窗；空或失败时回退 SQLite 持久 turn。"""
-    try:
-        lines = session_cache.format_recent_history(session_id=session_id, limit=limit)
-        if lines:
-            return lines
-    except Exception:
-        pass
-    try:
-        return get_memory_db().format_chat_history(session_id, limit=limit)
-    except Exception:
-        return []
-
-
 def _persist_turn(session_id: str, user_text: str, assistant_text: str) -> None:
-    """双写：Redis 热缓存 + SQLite 冷历史（互不影响失败）。"""
-    try:
-        session_cache.append_turn(
-            session_id=session_id,
-            user_text=user_text,
-            assistant_text=assistant_text,
-        )
-    except Exception:
-        pass
-    try:
-        get_memory_db().append_chat_turn(session_id, user_text, assistant_text)
-    except Exception as e:
-        print(f"⚠️ [chat-persist] SQLite 写 turn 失败: {e}")
+    """供 proactive 注册；委托 SessionHistory 双写。"""
+    from memory.session_history import append_turn
+
+    append_turn(
+        session_id,
+        user_text,
+        assistant_text,
+        session_cache=session_cache,
+    )
 
 
 def _load_history_turns(session_id: str, limit: int = 50) -> list[dict]:
-    """history/export：优先持久层；若无记录再试 Redis。"""
-    try:
-        turns = get_memory_db().get_chat_turns(session_id, limit=limit)
-        if turns:
-            return turns
-    except Exception as e:
-        print(f"⚠️ [chat-history] SQLite 读失败: {e}")
-    try:
-        return session_cache.get_recent_turns(session_id=session_id, limit=limit)
-    except Exception:
-        return []
+    return turn_service.load_history_ui(session_id, limit=limit)
+
+
+def _to_turn_request(
+    payload: "ChatRequest",
+    *,
+    memory_thread_id: str | None = None,
+) -> TurnRequest:
+    return TurnRequest(
+        text=payload.text,
+        workflow_mode=payload.workflow_mode,
+        forced_persona=payload.forced_persona,
+        strip_persona_prefix=payload.strip_persona_prefix,
+        group_mode=payload.group_mode,
+        memory_thread_id=memory_thread_id,
+    )
+
+
+def _execute_turn(
+    payload: "ChatRequest",
+    session_id: str,
+    *,
+    memory_thread_id: str | None = None,
+):
+    """兼容壳：委托 TurnService.run。"""
+    result = turn_service.run(
+        _to_turn_request(payload, memory_thread_id=memory_thread_id),
+        session_id,
+    )
+    return (
+        result.reply,
+        result.intent,
+        result.trace_raw,
+        result.active_task_type,
+        result.active_persona,
+    )
+
+
+def _resolve_group_mode(payload: "ChatRequest") -> bool:
+    return resolve_group_mode(_to_turn_request(payload))
+
+
+def _after_turn_memory(
+    session_id: str,
+    user_text: str,
+    reply_for_client: str,
+    active_persona: str,
+    *,
+    group_mode: bool,
+    memory_thread_id: str | None = None,
+) -> str:
+    return turn_service.after_turn(
+        session_id,
+        user_text,
+        reply_for_client,
+        active_persona,
+        group_mode=group_mode,
+        memory_thread_id=memory_thread_id,
+    )
 
 
 @app.get("/api/v1/health")
 def api_health():
     """轻量探活：供 Next 开发代理与运维脚本探测；不调用大模型。"""
-    redis_ok = False
-    try:
-        session_cache.client.ping()
-        redis_ok = True
-    except Exception:
-        pass
+    # SessionCache.ping 内含熔断，Redis 宕机时不会每请求拖满 socket_timeout
+    redis_ok = session_cache.ping()
     return {
         "ok": True,
         "redis": redis_ok,
         "llm_provider": get_llm_provider(),
         "chat_model": get_chat_model(),
     }
+
+
+class PresenceRequest(BaseModel):
+    session_id: str = Field(..., min_length=1, max_length=200)
+    memory_thread_id: Optional[str] = Field(
+        default=None,
+        description="共享记忆池 ID；缺省等同 session_id",
+    )
+
+
+class PresenceResponse(BaseModel):
+    ok: bool = True
+    session_id: str
+    memory_thread_id: str
+
+
+@app.post("/api/v1/presence", response_model=PresenceResponse)
+def presence_api(payload: PresenceRequest):
+    """Solo 前端上报当前活跃对话，供主动开口落点。"""
+    try:
+        target = set_presence(payload.session_id, payload.memory_thread_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return PresenceResponse(
+        session_id=target.session_id,
+        memory_thread_id=target.memory_thread_id,
+    )
+
+
+@app.get("/api/v1/presence")
+def presence_get_api():
+    target = get_presence()
+    if target is None:
+        return {"ok": True, "session_id": None, "memory_thread_id": None}
+    return {
+        "ok": True,
+        "session_id": target.session_id,
+        "memory_thread_id": target.memory_thread_id,
+        "updated_at": target.updated_at,
+    }
+
+
+@app.get("/api/v1/proactive/pending")
+def proactive_pending_api():
+    """托盘拉取未读主动消息；拉取后标记已读。"""
+    items = drain_pending(mark_consumed=True)
+    return {"ok": True, "items": items}
+
+
+class AttachmentIngestResponse(BaseModel):
+    name: str
+    kind: Literal["text", "image"]
+    text: str
+    truncated: bool = False
+
+
+class SttResponse(BaseModel):
+    text: str
+
+
+@app.post("/api/v1/attachments/ingest", response_model=AttachmentIngestResponse)
+async def attachments_ingest_api(file: UploadFile = File(...)):
+    """Solo 附件消化：文本抽取或图片 VL 描述 → 纯文本，供拼进 chat。"""
+    from modules.attachments.service import AttachmentError, ingest_bytes
+
+    data = await file.read()
+    try:
+        result = ingest_bytes(
+            data,
+            filename=file.filename or "upload",
+            content_type=file.content_type or "",
+        )
+    except AttachmentError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return AttachmentIngestResponse(
+        name=result.name,
+        kind=result.kind,
+        text=result.text,
+        truncated=result.truncated,
+    )
+
+
+@app.post("/api/v1/stt", response_model=SttResponse)
+async def stt_api(audio: UploadFile = File(...)):
+    """服务端语音转写（浏览器 Web Speech 不可用时的回退）。"""
+    from modules.stt.service import SttError, transcribe_audio
+
+    data = await audio.read()
+    try:
+        text = transcribe_audio(
+            data,
+            filename=audio.filename or "audio.webm",
+            content_type=audio.content_type or "",
+        )
+    except SttError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return SttResponse(text=text)
+
+
+class ImageGenerateRequest(BaseModel):
+    persona_id: str = Field(default="bina", min_length=1, max_length=64)
+    scene: str = Field(default="", max_length=2000)
+    mode: Literal["selfie", "scene"] = "selfie"
+
+
+class ImageGenerateResponse(BaseModel):
+    persona_id: str
+    url: str
+    prompt: str
+
+
+@app.get("/api/v1/images/persona/{persona_id}")
+def image_persona_profile_api(persona_id: str):
+    """查看人格定妆配置（不含密钥；用于确认 LoRA 是否挂上）。"""
+    from modules.image_gen.profiles import load_visual_profile, profile_to_public
+
+    profile = load_visual_profile(persona_id)
+    if profile is None:
+        raise HTTPException(status_code=404, detail="未找到视觉定妆配置")
+    return profile_to_public(profile)
+
+
+@app.post("/api/v1/images/generate", response_model=ImageGenerateResponse)
+def image_generate_api(payload: ImageGenerateRequest):
+    """ComfyUI + 定妆 LoRA 出图（需本机 ComfyUI :8188）。"""
+    from modules.image_gen.service import ImageGenError, generate_persona_image
+
+    try:
+        img = generate_persona_image(
+            payload.persona_id,
+            scene=payload.scene,
+            mode=payload.mode,
+        )
+    except ImageGenError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return ImageGenerateResponse(
+        persona_id=img.persona_id,
+        url=img.relative_url,
+        prompt=img.prompt,
+    )
+
+
+@app.get("/api/v1/images/file/{file_name}")
+def image_file_api(file_name: str):
+    """读取已生成图片。"""
+    import os
+    from pathlib import Path
+
+    from fastapi.responses import FileResponse
+
+    safe = Path(file_name).name
+    if safe != file_name or ".." in file_name:
+        raise HTTPException(status_code=400, detail="非法文件名")
+    root = Path(os.getenv("AX_IMAGE_OUT_DIR") or (Path(__file__).resolve().parent / "data" / "generated"))
+    path = root / safe
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="图片不存在")
+    media = "image/png" if path.suffix.lower() == ".png" else "image/jpeg"
+    return FileResponse(path, media_type=media)
 
 
 WorkflowMode = Literal["default", "dev_pipeline"]
@@ -203,142 +409,42 @@ class ChatHistoryResponse(BaseModel):
     turns: List[ChatExportItem]
 
 
-def _execute_turn(payload: ChatRequest, session_id: str) -> tuple[str, TaskIntent, list, str, str]:
-    """
-    执行一轮对话或工作流。返回 (reply, intent, trace_raw, active_task_type, active_persona)。
-
-    默认 reply 带 `[persona]:` 前缀；`strip_persona_prefix=True`（Group Chat）时对外去前缀，
-    调用方应用带前缀文本写回记忆。
-    """
-    if payload.workflow_mode == "dev_pipeline":
-        reply_raw, trace_raw = run_dev_pipeline(payload.text, get_llm())
-        intent = synthetic_intent_for_workflow(payload.text, task_type="bit")
-        active_task_type = "dev_pipeline"
-        active_persona = "bit"
-    else:
-        recent_history = _load_recent_history(session_id, limit=5)
-        graph_state = {
-            "current_input": payload.text,
-            "thread_id": session_id,
-            "recent_history": recent_history,
-        }
-        forced = _normalize_persona(payload.forced_persona)
-        if forced:
-            graph_state["forced_persona"] = forced
-        result, trace_raw = run_router_traced(router_graph, graph_state)
-        reply_raw = str(result.get("final_response", ""))
-        intent = result.get("intent")
-        if intent is None:
-            raise HTTPException(status_code=500, detail="router returned empty intent")
-        active_task_type = result.get("active_task_type")
-        if active_task_type is None:
-            active_task_type = getattr(intent, "task_type", None)
-        active_persona = result.get("active_persona") or getattr(intent, "persona", None)
-
-    prefix_map = {
-        "emotion": "bina",
-        "jean": "jean",
-        "bit": "bit",
-        "juzheng": "juzheng",
-        "unknown": "juzheng",
-        "dev_pipeline": "dev",
-    }
-    prefix = str(active_persona) if active_persona else prefix_map.get(str(active_task_type), "juzheng")
-    reply_clean = re.sub(r"^\s*\[[^\]]+]\s*[:：]\s*", "", str(reply_raw))
-    reply_labeled = f"[{prefix}]: {reply_clean}"
-    reply_out = reply_clean if payload.strip_persona_prefix else reply_labeled
-    return reply_out, intent, trace_raw, str(active_task_type), str(active_persona or prefix)
-
-
-def _resolve_group_mode(payload: ChatRequest) -> bool:
-    """显式 group_mode 优先；未传时兼容旧客户端：有 forced_persona 视为群聊。"""
-    if payload.group_mode is not None:
-        return bool(payload.group_mode)
-    return bool(payload.forced_persona)
-
-
-def _after_turn_memory(
-    session_id: str,
-    user_text: str,
-    reply_for_client: str,
-    active_persona: str,
-    *,
-    group_mode: bool,
-) -> str:
-    """写回 L1、可选 M1/M2，并在散会口令时压缩进 M3。返回可能带前缀的持久化文本。
-
-    - L1/L2：始终写回
-    - M1 吵架缓冲：仅群聊
-    - M2 人设私忆：有 active_persona 即调度（单聊 Bina 也需要）
-    """
-    labeled = reply_for_client
-    if not re.match(r"^\s*\[[^\]]+]\s*[:：]", reply_for_client or ""):
-        labeled = f"[{active_persona}]: {reply_for_client}"
-
-    _persist_turn(session_id, user_text, labeled)
-    maybe_trigger_rolling_summary(session_id, session_cache, get_memory_db())
-
-    clean_assistant = re.sub(r"^\s*\[[^\]]+]\s*[:：]\s*", "", labeled)
-
-    if group_mode and active_persona:
-        try:
-            append_debate_exchange(
-                session_id,
-                user_text=user_text,
-                assistant_text=clean_assistant,
-                persona=active_persona,
-            )
-        except Exception as e:
-            print(f"⚠️ [cabinet] M1 写回失败: {e}")
-
-    if active_persona:
-        try:
-            async_tasks.schedule(
-                extract_persona_private,
-                session_id,
-                active_persona,
-                user_text=user_text,
-                assistant_text=clean_assistant,
-            )
-        except Exception as e:
-            print(f"⚠️ [cabinet] M2 私忆调度失败: {e}")
-
-    if detect_consensus_close(user_text) or detect_consensus_close(reply_for_client):
-        try:
-            summary = close_and_compress(session_id)
-            if summary:
-                print(f"📜 [cabinet] 已散会并写入共识: {summary[:80]}...")
-        except Exception as e:
-            print(f"⚠️ [cabinet] 共识压缩失败: {e}")
-
-    return labeled
-
-
 @app.post("/api/v1/chat", response_model=ChatResponse)
 async def chat_api(
     payload: ChatRequest,
     response: Response,
+    background_tasks: BackgroundTasks,
     x_session_id: str | None = Header(default=None),
     x_trace_id: str | None = Header(default=None, alias="x-trace-id"),
+    x_memory_thread: str | None = Header(default=None, alias="x-memory-thread"),
 ):
     session_id = x_session_id or str(uuid4())
+    memory_thread_id = (x_memory_thread or "").strip() or session_id
     trace_id = (x_trace_id or "").strip() or str(uuid4())
     response.headers["X-Trace-Id"] = trace_id
 
     try:
-        reply, intent, trace_raw, _active, active_persona = _execute_turn(payload, session_id)
+        reply, intent, trace_raw, _active, active_persona = _execute_turn(
+            payload, session_id, memory_thread_id=memory_thread_id
+        )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
 
-    _after_turn_memory(
-        session_id,
-        payload.text,
-        reply,
-        active_persona,
-        group_mode=_resolve_group_mode(payload),
-    )
+    group_mode = _resolve_group_mode(payload)
+    # 先回客户端，再后台写 L1/M2，降低可感知等待
+    def _persist_bg() -> None:
+        _after_turn_memory(
+            session_id,
+            payload.text,
+            reply,
+            active_persona,
+            group_mode=group_mode,
+            memory_thread_id=memory_thread_id,
+        )
+
+    background_tasks.add_task(_persist_bg)
 
     trace = [TraceStep.model_validate(s) for s in trace_raw]
     return ChatResponse(
@@ -356,34 +462,56 @@ async def chat_stream_api(
     payload: ChatRequest,
     x_session_id: str | None = Header(default=None),
     x_trace_id: str | None = Header(default=None, alias="x-trace-id"),
+    x_memory_thread: str | None = Header(default=None, alias="x-memory-thread"),
 ):
     """
     SSE 流式输出接口：返回 text/event-stream。
-    说明：本实现先走一次 router 生成完整回复，然后把 reply 按片段分批吐给前端。
-    这样可以不破坏现有 LangGraph 逻辑，同时让前端获得“打字机效果”的流式体验。
+
+    仍为伪流式（整轮完成后再切块），但在 `_execute_turn` 期间定期发 heartbeat，
+    避免前端/代理以为连接挂死。
     """
     session_id = x_session_id or str(uuid4())
+    memory_thread_id = (x_memory_thread or "").strip() or session_id
     trace_id = (x_trace_id or "").strip() or str(uuid4())
+    group_mode = _resolve_group_mode(payload)
 
-    try:
-        reply, intent, trace_raw, _active, active_persona = _execute_turn(payload, session_id)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
-
-    _after_turn_memory(
-        session_id,
-        payload.text,
-        reply,
-        active_persona,
-        group_mode=_resolve_group_mode(payload),
-    )
-
-    trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
+    def _run_turn_only():
+        return _execute_turn(payload, session_id, memory_thread_id=memory_thread_id)
 
     async def event_gen():
-        # 1) meta（含全链路追踪，便于前端展示）
+        yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
+
+        turn_task = asyncio.create_task(asyncio.to_thread(_run_turn_only))
+        while not turn_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(turn_task), timeout=2.0)
+            except asyncio.TimeoutError:
+                yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
+
+        try:
+            reply, intent, trace_raw, _active, active_persona = turn_task.result()
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            yield f"data: {json.dumps({'type': 'error', 'detail': detail}, ensure_ascii=False)}\n\n"
+            return
+        except Exception as exc:
+            yield f"data: {json.dumps({'type': 'error', 'detail': f'turn failed: {exc}'}, ensure_ascii=False)}\n\n"
+            return
+
+        # 先吐字，再后台持久化
+        def _persist_bg() -> None:
+            _after_turn_memory(
+                session_id,
+                payload.text,
+                reply,
+                active_persona,
+                group_mode=group_mode,
+                memory_thread_id=memory_thread_id,
+            )
+
+        asyncio.create_task(asyncio.to_thread(_persist_bg))
+
+        trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
         meta = {
             "session_id": session_id,
             "intent": intent.model_dump(),
@@ -394,7 +522,6 @@ async def chat_stream_api(
         }
         yield f"data: {json.dumps(meta, ensure_ascii=False)}\n\n"
 
-        # 2) content chunks (pseudo streaming)
         chunk_size = 12
         for i in range(0, len(reply), chunk_size):
             piece = reply[i : i + chunk_size]
@@ -402,13 +529,12 @@ async def chat_stream_api(
             yield f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
             await asyncio.sleep(0.01)
 
-        # 3) done
         yield f"data: {json.dumps({'type': 'done'}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(
         event_gen(),
         media_type="text/event-stream",
-        headers={"X-Trace-Id": trace_id},
+        headers={"X-Trace-Id": trace_id, "Cache-Control": "no-cache"},
     )
 
 

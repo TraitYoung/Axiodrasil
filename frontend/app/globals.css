@@ -1,15 +1,16 @@
 @import "tailwindcss";
 
 :root {
-  --ax-bg0: #1a1510;
-  --ax-bg1: #241c14;
-  --ax-panel: rgba(42, 32, 24, 0.72);
-  --ax-fg: #f3ebe0;
-  --ax-muted: #a89885;
-  --ax-line: rgba(196, 168, 130, 0.22);
-  --ax-accent: #c4a882;
-  --ax-accent-fg: #1a1510;
-  --ax-user: #3d5a4c;
+  --ax-bg0: #14121b;
+  --ax-bg1: #1e1929;
+  --ax-panel: rgba(36, 29, 48, 0.66);
+  --ax-fg: #f5f0ff;
+  --ax-muted: #a79ec2;
+  --ax-line: rgba(196, 178, 232, 0.2);
+  --ax-accent: #c6a9f0;
+  --ax-accent-2: #8fd3c7;
+  --ax-accent-fg: #17131f;
+  --ax-user: #3f6b5e;
   --background: var(--ax-bg0);
   --foreground: var(--ax-fg);
   --font-display: var(--font-cormorant), "Times New Roman", serif;
@@ -28,13 +29,25 @@ body {
   color: var(--ax-fg);
   font-family: var(--font-body);
   background:
-    radial-gradient(ellipse 80% 50% at 10% -10%, rgba(196, 168, 130, 0.18), transparent 55%),
-    radial-gradient(ellipse 60% 40% at 90% 0%, rgba(90, 60, 40, 0.35), transparent 50%),
-    linear-gradient(165deg, var(--ax-bg0), var(--ax-bg1) 45%, #120e0a);
+    radial-gradient(ellipse 90% 55% at 15% -10%, rgba(198, 169, 240, 0.22), transparent 58%),
+    radial-gradient(ellipse 70% 50% at 88% 6%, rgba(143, 211, 199, 0.18), transparent 55%),
+    linear-gradient(160deg, var(--ax-bg0), var(--ax-bg1) 42%, #100d16);
+  background-attachment: fixed;
+  animation: ax-bg-breathe 14s ease-in-out infinite alternate;
+}
+
+@keyframes ax-bg-breathe {
+  from {
+    background-position: 0 0, 0 0, 0 0;
+  }
+  to {
+    background-position: 4% 6%, -4% -3%, 0 0;
+  }
 }
 
 .ax-header {
-  background: rgba(26, 21, 16, 0.82);
+  background: rgba(20, 18, 27, 0.74);
+  backdrop-filter: blur(14px);
 }
 
 .ax-brand {
@@ -49,7 +62,16 @@ body {
   font-size: 1.35rem;
   font-weight: 600;
   letter-spacing: 0.04em;
-  color: var(--ax-accent);
+  background: linear-gradient(120deg, var(--ax-accent), var(--ax-accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.ax-nav-pill--active {
+  background: linear-gradient(120deg, var(--ax-accent), var(--ax-accent-2));
+  color: var(--ax-accent-fg);
+  box-shadow: 0 4px 14px rgba(198, 169, 240, 0.28);
 }
 
 .ax-brand-sub {
@@ -64,48 +86,74 @@ body {
   border: 1px solid var(--ax-line);
   border-radius: 1rem;
   background: var(--ax-panel);
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px);
   padding: 0.75rem;
+  box-shadow: 0 10px 32px rgba(8, 6, 14, 0.28);
 }
 
 .ax-bubble-user {
   border-radius: 1.1rem 1.1rem 0.35rem 1.1rem;
-  background: linear-gradient(145deg, #4a6b5a, var(--ax-user));
-  color: #f5faf7;
+  background: linear-gradient(145deg, #4f8a77, var(--ax-user));
+  color: #f2fbf7;
+  box-shadow: 0 4px 14px rgba(63, 107, 94, 0.35);
 }
 
 .ax-bubble-assistant {
   border-radius: 1.1rem 1.1rem 1.1rem 0.35rem;
   border: 1px solid var(--ax-line);
   border-left-width: 3px;
-  background: rgba(20, 16, 12, 0.55);
+  background: linear-gradient(160deg, rgba(28, 23, 38, 0.88), rgba(20, 16, 28, 0.72));
+  box-shadow: 0 4px 16px rgba(8, 6, 14, 0.32);
+}
+
+.ax-msg {
+  animation: ax-rise 0.32s cubic-bezier(0.22, 0.9, 0.32, 1) both;
+}
+
+@keyframes ax-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .ax-input {
   border: 1px solid var(--ax-line);
   border-radius: 0.85rem;
-  background: rgba(12, 10, 8, 0.55);
+  background: rgba(14, 12, 20, 0.6);
   color: var(--ax-fg);
   padding: 0.75rem 0.9rem;
   outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
 }
 
 .ax-input:focus {
   border-color: var(--ax-accent);
-  box-shadow: 0 0 0 2px rgba(196, 168, 130, 0.2);
+  background: rgba(18, 15, 26, 0.72);
+  box-shadow: 0 0 0 3px rgba(198, 169, 240, 0.16), 0 0 18px rgba(143, 211, 199, 0.08);
 }
 
 .ax-btn-primary {
   border-radius: 999px;
-  background: var(--ax-accent);
+  background: linear-gradient(120deg, var(--ax-accent), var(--ax-accent-2));
   color: var(--ax-accent-fg);
   font-weight: 600;
   padding: 0.5rem 1.1rem;
-  transition: transform 0.15s ease, opacity 0.15s ease;
+  transition: transform 0.18s ease, box-shadow 0.2s ease, filter 0.2s ease, opacity 0.15s ease;
 }
 
 .ax-btn-primary:hover:not(:disabled) {
-  transform: translateY(-1px);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 22px rgba(198, 169, 240, 0.28), 0 4px 14px rgba(143, 211, 199, 0.18);
+  filter: brightness(1.05);
+}
+
+.ax-btn-primary:active:not(:disabled) {
+  transform: translateY(0) scale(0.98);
 }
 
 .ax-btn-primary:disabled,
@@ -120,34 +168,146 @@ body {
   color: var(--ax-fg);
   padding: 0.4rem 0.9rem;
   font-size: 0.875rem;
-  transition: background 0.15s ease;
+  transition: background 0.18s ease, border-color 0.18s ease, transform 0.15s ease;
 }
 
 .ax-btn-ghost:hover:not(:disabled) {
-  background: rgba(196, 168, 130, 0.12);
+  background: rgba(198, 169, 240, 0.14);
+  border-color: rgba(198, 169, 240, 0.45);
+  transform: translateY(-1px);
 }
 
 .ax-card-tile {
   border: 1px solid var(--ax-line);
   border-radius: 0.85rem;
-  background: rgba(12, 10, 8, 0.35);
+  background: linear-gradient(165deg, rgba(26, 21, 36, 0.55), rgba(16, 13, 22, 0.45));
   padding: 0.75rem;
+  transition: border-color 0.2s ease, box-shadow 0.25s ease;
+}
+
+.ax-card-tile:hover {
+  border-color: rgba(198, 169, 240, 0.38);
+  box-shadow: 0 8px 24px rgba(10, 8, 16, 0.35);
 }
 
 .ax-drawer {
-  background: linear-gradient(180deg, #2a2018, #1a1510);
+  background: linear-gradient(180deg, #2a2138, #16121f);
   border-left: 1px solid var(--ax-line);
-  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.4);
+  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.45);
 }
 
-.ax-typing::after {
-  content: "";
-  animation: ax-blink 1s steps(2, end) infinite;
+.ax-typing-dots {
+  display: inline-flex;
+  gap: 3px;
+  margin-left: 0.35rem;
+  vertical-align: baseline;
 }
 
-@keyframes ax-blink {
+.ax-typing-dots span {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--ax-accent);
+  opacity: 0.35;
+  animation: ax-dot 1.1s ease-in-out infinite;
+}
+
+.ax-typing-dots span:nth-child(2) {
+  animation-delay: 0.15s;
+}
+
+.ax-typing-dots span:nth-child(3) {
+  animation-delay: 0.3s;
+}
+
+@keyframes ax-dot {
+  0%,
+  100% {
+    opacity: 0.25;
+    transform: translateY(0);
+  }
   50% {
-    content: "·";
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+/* ── 等待占位（Bina 接通 / 思考）───────────────── */
+.ax-cute-wait {
+  animation: ax-fade-in 0.45s ease both;
+}
+
+.ax-cute-orb {
+  position: relative;
+  width: 4.5rem;
+  height: 4.5rem;
+  display: grid;
+  place-items: center;
+}
+
+.ax-cute-orb__core {
+  position: relative;
+  z-index: 1;
+  width: 2.6rem;
+  height: 2.6rem;
+  border-radius: 999px;
+  display: grid;
+  place-items: center;
+  font-family: var(--font-display);
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--ax-accent-fg);
+  background: linear-gradient(135deg, var(--ax-accent), var(--ax-accent-2));
+  box-shadow: 0 8px 24px rgba(198, 169, 240, 0.35);
+  animation: ax-cute-bob 2.4s ease-in-out infinite;
+}
+
+.ax-cute-orb__ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 999px;
+  border: 2px solid rgba(198, 169, 240, 0.45);
+  animation: ax-cute-ring 2.2s ease-out infinite;
+}
+
+.ax-cute-orb__ring--delay {
+  animation-delay: 0.7s;
+  border-color: rgba(143, 211, 199, 0.4);
+}
+
+.ax-cute-line {
+  animation: ax-cute-swap 0.35s ease both;
+}
+
+@keyframes ax-cute-bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+@keyframes ax-cute-ring {
+  0% {
+    transform: scale(0.55);
+    opacity: 0.75;
+  }
+  100% {
+    transform: scale(1.15);
+    opacity: 0;
+  }
+}
+
+@keyframes ax-cute-swap {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
   }
 }
 
@@ -188,8 +348,8 @@ body {
   overflow: hidden;
   text-align: center;
   background:
-    radial-gradient(ellipse 70% 45% at 50% 20%, rgba(196, 168, 130, 0.22), transparent 60%),
-    linear-gradient(165deg, #120e0a, var(--ax-bg0) 40%, #1a1510);
+    radial-gradient(ellipse 75% 50% at 50% 18%, rgba(198, 169, 240, 0.24), transparent 62%),
+    linear-gradient(165deg, #100d16, var(--ax-bg0) 42%, var(--ax-bg1));
   animation: ax-splash-in 0.55s ease both;
 }
 
@@ -200,10 +360,10 @@ body {
 
 .ax-splash-glow {
   position: absolute;
-  inset: 20% 30%;
+  inset: 18% 26%;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(196, 168, 130, 0.18), transparent 70%);
-  filter: blur(28px);
+  background: radial-gradient(circle, rgba(198, 169, 240, 0.2), transparent 68%);
+  filter: blur(30px);
   pointer-events: none;
   animation: ax-splash-pulse 3.2s ease-in-out infinite;
 }
@@ -224,7 +384,10 @@ body {
   font-size: clamp(2.8rem, 8vw, 4.5rem);
   font-weight: 600;
   letter-spacing: 0.06em;
-  color: var(--ax-accent);
+  background: linear-gradient(120deg, var(--ax-accent), var(--ax-accent-2));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
   animation: ax-splash-brand 0.7s ease 0.15s both;
 }
 
@@ -242,17 +405,17 @@ body {
   position: relative;
   margin-top: 1.25rem;
   border-radius: 999px;
-  background: var(--ax-accent);
+  background: linear-gradient(120deg, var(--ax-accent), var(--ax-accent-2));
   color: var(--ax-accent-fg);
   font-weight: 600;
   padding: 0.65rem 1.4rem;
-  transition: transform 0.15s ease, box-shadow 0.15s ease;
+  transition: transform 0.18s ease, box-shadow 0.2s ease;
   animation: ax-fade-in 0.55s ease 0.5s both;
 }
 
 .ax-splash-cta:hover {
   transform: translateY(-2px);
-  box-shadow: 0 8px 24px rgba(196, 168, 130, 0.25);
+  box-shadow: 0 10px 28px rgba(198, 169, 240, 0.3), 0 6px 16px rgba(143, 211, 199, 0.2);
 }
 
 @keyframes ax-splash-in {
