@@ -207,7 +207,7 @@ Enrichment model: `AX_ENRICHMENT_MODEL` (default "qwen-turbo", cheaper than main
 
 Solo 附件/语音：图片描述 `AX_VL_MODEL`（默认 `qwen-vl-plus`）、服务端 STT `AX_STT_MODEL`（默认 `qwen2-audio-instruct`），均复用 `QWEN_API_KEY`。前端优先浏览器 Web Speech，失败再走 `/api/v1/stt`；附件经 ingest 后拼进 `chat` 的 `text`（不改 L1 schema）。
 
-Bina 定妆出图：本地 ComfyUI（`AX_COMFYUI_URL`）+ `config/persona_visual/bina.json` 的 LoRA；要自拍时 `node_bina` 调用出图并拼 markdown。详见 `docs/Bina_Image_Gen.md`。
+Bina 定妆出图：本地 ComfyUI（`AX_COMFYUI_URL`）+ `config/persona_visual/bina.json` 的 LoRA；要自拍时 `node_bina` 调用出图并拼 markdown。**Bina 视觉唯一真相源**即该 JSON（`canon` + prompt）；BIOS / 角色卡只引用摘要。详见 `docs/Bina_Image_Gen.md`。
 
 ### Tracing
 

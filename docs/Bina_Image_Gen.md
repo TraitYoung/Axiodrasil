@@ -2,6 +2,16 @@
 
 参考邻舍.EXE：角色卡挂 **LoRA** → ComfyUI 工作流注入 `LoraLoader` → 聊天里要自拍时真的出图。
 
+## 视觉真相源（SSOT）
+
+**唯一外貌真相源：** [`config/persona_visual/bina.json`](../config/persona_visual/bina.json)
+
+| 字段 | 职责 |
+|------|------|
+| `canon` | 人读设定（发色/发型/眼睛/常服/禁忌）；BIOS 与角色卡只引用摘要 |
+| `appearance_prompt` 等 | 出图用英文底词，必须与 `canon` 一致 |
+| BIOS / SillyTavern 卡 | **不是**外貌真相源；冲突时以本 JSON 为准 |
+
 ## 前置
 
 1. 本机安装并启动 [ComfyUI](https://github.com/comfyanonymous/ComfyUI)，默认 `http://127.0.0.1:8188`
@@ -15,10 +25,11 @@
 
 | 字段 | 含义 |
 |------|------|
+| `canon` | 中文定妆正文（SSOT） |
 | `loras[].path` | 相对 `models/loras/` 的文件名 |
 | `loras[].weight` | 强度，常见 0.6–0.9 |
 | `loras[].trigger_word` | 训练时的触发词（必填才锁得住脸） |
-| `appearance_prompt` | 外貌底词（发色/眼睛/气质等） |
+| `appearance_prompt` | 外貌底词（须对齐 `canon`） |
 | `selfie_prompt` | 自拍构图标签 |
 | `negative_prompt` | 负向 |
 

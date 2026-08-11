@@ -29,6 +29,9 @@ class VisualProfile:
     negative_prompt: str = ""
     style_prompt: str = ""
     selfie_prompt: str = ""
+    # 人读设定（SSOT 正文）；出图仍用 appearance_prompt 等字段
+    canon: dict[str, Any] = field(default_factory=dict)
+    notes: str = ""
 
 
 def load_visual_profile(persona_id: str) -> VisualProfile | None:
@@ -69,6 +72,9 @@ def load_visual_profile(persona_id: str) -> VisualProfile | None:
             x for x in loras if x.path != env_lora
         ]
 
+    canon_raw = data.get("canon")
+    canon = dict(canon_raw) if isinstance(canon_raw, dict) else {}
+
     return VisualProfile(
         persona_id=str(data.get("persona_id") or pid),
         display_name=str(data.get("display_name") or pid),
@@ -78,6 +84,8 @@ def load_visual_profile(persona_id: str) -> VisualProfile | None:
         negative_prompt=str(data.get("negative_prompt") or "").strip(),
         style_prompt=str(data.get("style_prompt") or "").strip(),
         selfie_prompt=str(data.get("selfie_prompt") or "").strip(),
+        canon=canon,
+        notes=str(data.get("notes") or "").strip(),
     )
 
 
@@ -86,9 +94,12 @@ def profile_to_public(profile: VisualProfile) -> dict[str, Any]:
         "persona_id": profile.persona_id,
         "display_name": profile.display_name,
         "enabled": profile.enabled,
+        "ssot": "config/persona_visual/{}.json".format(profile.persona_id),
+        "canon": profile.canon,
         "loras": [
             {"path": x.path, "weight": x.weight, "trigger_word": x.trigger_word}
             for x in profile.loras
         ],
         "has_appearance": bool(profile.appearance_prompt),
+        "notes": profile.notes,
     }

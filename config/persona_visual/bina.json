@@ -2,6 +2,19 @@
   "persona_id": "bina",
   "display_name": "Bina",
   "enabled": true,
+  "ssot": true,
+  "canon": {
+    "full_name": "陈比娜 (Chen Bina)",
+    "role": "首席私人秘书",
+    "height_cm": 163,
+    "hair": "浅灰紫日式短发：下巴长度轻盈层次 bob，浅刘海",
+    "eyes": "琥珀色",
+    "default_outfit": "轻秘书感整洁衬衫 / blouse，元气日常",
+    "vibe": "元气偶像 × 死党式共情",
+    "forbidden": ["长发", "双马尾", "马尾", "编发作为默认发型", "女仆围裙作为默认常服"],
+    "fusion_refs": "气质参考：派蒙(向导) + 喜多(社交) + 胡桃(搞怪)；非外观复制",
+    "summary_zh": "163cm；浅灰紫日式短发（下巴长度层次 bob + 浅刘海）；琥珀色眼睛；默认轻秘书衬衫；元气偶像气质。"
+  },
   "loras": [
     {
       "path": "bina.safetensors",
@@ -9,9 +22,9 @@
       "trigger_word": "bina_char"
     }
   ],
-  "appearance_prompt": "1girl, solo, young woman, soft lavender hair, shoulder-length wavy hair, amber eyes, gentle smile, light makeup, cute secretary vibe, neat blouse",
-  "negative_prompt": "lowres, blurry, deformed, bad anatomy, extra fingers, watermark, text, logo, multiple people, male, child",
+  "appearance_prompt": "1girl, solo, young woman, soft ash lavender hair, japanese short hair, soft bob cut, chin-length layered short hair, light bangs, amber eyes, gentle smile, light makeup, cute secretary vibe, neat blouse",
+  "negative_prompt": "lowres, blurry, deformed, bad anatomy, extra fingers, watermark, text, logo, multiple people, male, child, long hair, twin tails, ponytail, braid, maid apron, maid headdress",
   "style_prompt": "anime illustration, clean lineart, soft lighting, high detail face",
   "selfie_prompt": "selfie, looking at viewer, phone camera angle, upper body, indoor, natural light, candid",
-  "notes": "将训好的 Bina LoRA 放到 ComfyUI/models/loras/，文件名与 path 一致；trigger_word 必须与训练时一致。"
+  "notes": "本文件是 Bina 视觉形象唯一真相源（SSOT）。改外貌只改这里；BIOS / SillyTavern 卡只引用 canon.summary_zh，勿另起一套。"
 }
