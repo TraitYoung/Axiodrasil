@@ -4,7 +4,7 @@
 
 export type HealthStatus = {
   ok: boolean;
-  redis?: boolean;
+  memory_backend?: string;
   llm_provider?: string;
   chat_model?: string;
 };
@@ -44,19 +44,9 @@ export type StreamChatInput = {
   memoryThreadId?: string;
   forcedPersona?: string | null;
   stripPersonaPrefix?: boolean;
-  /** true=群聊写 M1；false=单聊不写 M1。缺省由后端按 forced_persona 回退。 */
-  groupMode?: boolean;
-  workflowMode?: string;
   signal?: AbortSignal;
   onMeta?: (meta: ChatStreamMeta) => void;
   onDelta?: (chunk: string) => void;
-};
-
-export type ConsensusResult = {
-  session_id: string;
-  ok: boolean;
-  summary: string;
-  message: string;
 };
 
 export type AttachmentIngestResult = {
@@ -69,8 +59,6 @@ export type AttachmentIngestResult = {
 export type SttResult = {
   text: string;
 };
-
-export const GROUP_SESSION_ID = "ax-cabinet-main";
 
 export function soloSessionId(personaId: string, userLocalId: string): string {
   const pid = (personaId || "unknown").trim().toLowerCase();

@@ -6,35 +6,17 @@ import json
 from pathlib import Path
 from typing import Optional
 
-from agents.persona_meta import PERSONA_META
 from app.matrix.ports import PersonaCard
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _CARD_DIR = _PROJECT_ROOT / "sillytavern" / "character_card" / "group"
 
-PERSONA_COLORS: dict[str, str] = {
-    "bina": "#c45c6a",
-    "bit": "#3d7ea6",
-    "taki": "#6b7280",
-    "chizheng": "#8b5a2b",
-    "tianji": "#5b7c5a",
-    "fukucho": "#7a4d4d",
-    "vinci": "#9a6b3f",
-    "planck": "#4a6fa5",
-    "jiafa": "#6b5b7a",
-    "qianjin": "#a67c52",
-    "boming": "#5c4a3a",
-    "jean": "#4d6b5c",
-}
-
-GROUP_SESSION_ID = "ax-cabinet-main"
-
-# 公开 catalog 仅暴露 Bina；完整 PERSONA_META 仍保留以便路由/历史/未来复制人格。
+# 当前仅运行 Bina，其他人物设定见 docs/characters。
 PUBLIC_PERSONA_IDS: tuple[str, ...] = ("bina",)
 
 
 class PersonaCatalog:
-    """从 PERSONA_META + group 角色卡 JSON 组装只读视图模型。"""
+    """从 Bina 角色卡组装只读视图模型。"""
 
     def list_cards(self) -> list[PersonaCard]:
         cards: list[PersonaCard] = []
@@ -46,9 +28,9 @@ class PersonaCatalog:
 
     def get_card(self, persona_id: str) -> Optional[PersonaCard]:
         pid = (persona_id or "").strip().lower()
-        if pid not in PERSONA_META:
+        if pid not in PUBLIC_PERSONA_IDS:
             return None
-        name, title = PERSONA_META[pid]
+        name, title = "Bina", "虚拟具身实验伙伴"
         card_data = self._load_card_json(pid)
         description = ""
         personality = ""
@@ -75,7 +57,7 @@ class PersonaCatalog:
             personality=personality,
             greeting=greeting,
             model_id=f"axiodrasil-{pid}",
-            color=PERSONA_COLORS.get(pid, "#8b7355"),
+            color="#c45c6a",
             avatar=avatar,
         )
 
@@ -92,10 +74,7 @@ class PersonaCatalog:
 
 
 class SessionAdapter:
-    """SessionPort：群聊固定命名空间 / 单人按人设隔离。"""
-
-    def group_session_id(self) -> str:
-        return GROUP_SESSION_ID
+    """SessionPort：单人会话命名空间。"""
 
     def solo_session_id(self, persona_id: str, user_local_id: str) -> str:
         pid = (persona_id or "unknown").strip().lower()
@@ -106,4 +85,4 @@ class SessionAdapter:
     def resolve(self, raw: Optional[str], *, fallback: str = "") -> str:
         if raw and str(raw).strip():
             return str(raw).strip()
-        return fallback or GROUP_SESSION_ID
+        return fallback or "bina-local-user"

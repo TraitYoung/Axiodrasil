@@ -8,11 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Literal, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, Header, HTTPException, Response, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, Response, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from agents.persona_meta import PERSONA_META, PERSONA_TO_ROUTE, SUMMON_ALIASES
 from agents.proactive import (
     drain_pending,
     get_presence,
@@ -21,13 +20,11 @@ from agents.proactive import (
     start_proactive_loop,
     stop_proactive_loop,
 )
-from infrastructure.container import get_chat_model, get_llm_provider
-from memory.cabinet_layers import close_and_compress
+from infrastructure.container import get_chat_model, get_llm_provider, get_chat_history
+from memory.hindsight import resolve_memory_thread_id
 from modules.chat_api.service import (
     TurnRequest,
-    get_shared_session_cache,
     get_turn_service,
-    resolve_group_mode,
 )
 from schemas.protocols import TaskIntent
 from schemas.trace import TraceStep
@@ -45,7 +42,6 @@ async def _lifespan(_app: FastAPI):
 
 app = FastAPI(title="Axiodrasil Core API", version="1.0.0", lifespan=_lifespan)
 
-session_cache = get_shared_session_cache()
 turn_service = get_turn_service()
 
 # Host 接口矩阵：personas 与 bootstrap 解耦，避免矩阵失败导致角色卡 404 / 前端永久接通中
@@ -64,66 +60,8 @@ try:
 except Exception as _matrix_exc:  # pragma: no cover
     print(f"[host] matrix bootstrap failed: {_matrix_exc}")
 
-_AX_PERSONA_TAG_RE = re.compile(r"\[AX_PERSONA:([a-zA-Z]+)\]", re.IGNORECASE)
-_MODEL_PERSONA_RE = re.compile(
-    r"^(?:axiodrasil[-_])?([a-zA-Z]+)$", re.IGNORECASE
-)
-
-
-def _normalize_persona(token: Optional[str]) -> Optional[str]:
-    if not token or not str(token).strip():
-        return None
-    raw = str(token).strip()
-    mapped = SUMMON_ALIASES.get(raw) or SUMMON_ALIASES.get(raw.lower())
-    if mapped and mapped in PERSONA_TO_ROUTE:
-        return mapped
-    return None
-
-
-def _persona_from_model(model: str) -> Optional[str]:
-    if not model:
-        return None
-    m = _MODEL_PERSONA_RE.match(model.strip())
-    if not m:
-        return None
-    return _normalize_persona(m.group(1))
-
-
-def _persona_from_messages(messages: list) -> Optional[str]:
-    for msg in messages:
-        content = getattr(msg, "content", None) or ""
-        hit = _AX_PERSONA_TAG_RE.search(content)
-        if hit:
-            found = _normalize_persona(hit.group(1))
-            if found:
-                return found
-    return None
-
-
-def _resolve_forced_persona(
-    *,
-    x_persona: Optional[str],
-    model: Optional[str],
-    messages: Optional[list],
-) -> Optional[str]:
-    """优先级：x-persona 头 > model id > messages 内 [AX_PERSONA:id]。"""
-    return (
-        _normalize_persona(x_persona)
-        or _persona_from_model(model or "")
-        or _persona_from_messages(messages or [])
-    )
-
-
 def _persist_turn(session_id: str, user_text: str, assistant_text: str) -> None:
-    """供 proactive 注册；委托 SessionHistory 双写。"""
-    from memory.session_history import append_turn
-
-    append_turn(
-        session_id,
-        user_text,
-        assistant_text,
-        session_cache=session_cache,
-    )
+    get_chat_history().append_turn(session_id, user_text, assistant_text)
 
 
 def _load_history_turns(session_id: str, limit: int = 50) -> list[dict]:
@@ -156,6 +94,13 @@ def _execute_turn(
         _to_turn_request(payload, memory_thread_id=memory_thread_id),
         session_id,
     )
+    turn_service.after_turn(
+        session_id,
+        payload.text,
+        result.reply,
+        result.active_persona,
+        memory_thread_id=memory_thread_id,
+    )
     return (
         result.reply,
         result.intent,
@@ -165,37 +110,12 @@ def _execute_turn(
     )
 
 
-def _resolve_group_mode(payload: "ChatRequest") -> bool:
-    return resolve_group_mode(_to_turn_request(payload))
-
-
-def _after_turn_memory(
-    session_id: str,
-    user_text: str,
-    reply_for_client: str,
-    active_persona: str,
-    *,
-    group_mode: bool,
-    memory_thread_id: str | None = None,
-) -> str:
-    return turn_service.after_turn(
-        session_id,
-        user_text,
-        reply_for_client,
-        active_persona,
-        group_mode=group_mode,
-        memory_thread_id=memory_thread_id,
-    )
-
-
 @app.get("/api/v1/health")
 def api_health():
     """轻量探活：供 Next 开发代理与运维脚本探测；不调用大模型。"""
-    # SessionCache.ping 内含熔断，Redis 宕机时不会每请求拖满 socket_timeout
-    redis_ok = session_cache.ping()
     return {
         "ok": True,
-        "redis": redis_ok,
+        "memory_backend": "hindsight",
         "llm_provider": get_llm_provider(),
         "chat_model": get_chat_model(),
     }
@@ -379,7 +299,7 @@ class ChatRequest(BaseModel):
     )
     group_mode: Optional[bool] = Field(
         default=None,
-        description="True=群聊写 M1；False=单聊不写 M1（仍可写 M2 私忆）。缺省时回退为 bool(forced_persona)",
+        description="True=群聊写 M1；False=单聊不写 M1（仍可写 M2 私忆）。历史兼容字段，当前仅运行单聊",
     )
 
 
@@ -413,38 +333,23 @@ class ChatHistoryResponse(BaseModel):
 async def chat_api(
     payload: ChatRequest,
     response: Response,
-    background_tasks: BackgroundTasks,
     x_session_id: str | None = Header(default=None),
     x_trace_id: str | None = Header(default=None, alias="x-trace-id"),
     x_memory_thread: str | None = Header(default=None, alias="x-memory-thread"),
 ):
     session_id = x_session_id or str(uuid4())
-    memory_thread_id = (x_memory_thread or "").strip() or session_id
+    memory_thread_id = resolve_memory_thread_id(x_memory_thread)
     trace_id = (x_trace_id or "").strip() or str(uuid4())
     response.headers["X-Trace-Id"] = trace_id
 
     try:
-        reply, intent, trace_raw, _active, active_persona = _execute_turn(
-            payload, session_id, memory_thread_id=memory_thread_id
+        reply, intent, trace_raw, _active, active_persona = await asyncio.to_thread(
+            _execute_turn, payload, session_id, memory_thread_id=memory_thread_id
         )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
-
-    group_mode = _resolve_group_mode(payload)
-    # 先回客户端，再后台写 L1/M2，降低可感知等待
-    def _persist_bg() -> None:
-        _after_turn_memory(
-            session_id,
-            payload.text,
-            reply,
-            active_persona,
-            group_mode=group_mode,
-            memory_thread_id=memory_thread_id,
-        )
-
-    background_tasks.add_task(_persist_bg)
 
     trace = [TraceStep.model_validate(s) for s in trace_raw]
     return ChatResponse(
@@ -471,9 +376,8 @@ async def chat_stream_api(
     避免前端/代理以为连接挂死。
     """
     session_id = x_session_id or str(uuid4())
-    memory_thread_id = (x_memory_thread or "").strip() or session_id
+    memory_thread_id = resolve_memory_thread_id(x_memory_thread)
     trace_id = (x_trace_id or "").strip() or str(uuid4())
-    group_mode = _resolve_group_mode(payload)
 
     def _run_turn_only():
         return _execute_turn(payload, session_id, memory_thread_id=memory_thread_id)
@@ -487,6 +391,8 @@ async def chat_stream_api(
                 await asyncio.wait_for(asyncio.shield(turn_task), timeout=2.0)
             except asyncio.TimeoutError:
                 yield f"data: {json.dumps({'type': 'heartbeat'}, ensure_ascii=False)}\n\n"
+            except Exception:
+                break
 
         try:
             reply, intent, trace_raw, _active, active_persona = turn_task.result()
@@ -497,19 +403,6 @@ async def chat_stream_api(
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'detail': f'turn failed: {exc}'}, ensure_ascii=False)}\n\n"
             return
-
-        # 先吐字，再后台持久化
-        def _persist_bg() -> None:
-            _after_turn_memory(
-                session_id,
-                payload.text,
-                reply,
-                active_persona,
-                group_mode=group_mode,
-                memory_thread_id=memory_thread_id,
-            )
-
-        asyncio.create_task(asyncio.to_thread(_persist_bg))
 
         trace_payload = [TraceStep.model_validate(s).model_dump() for s in trace_raw]
         meta = {
@@ -616,8 +509,7 @@ async def chat_history_api(x_session_id: str | None = Header(default=None), limi
 # ==========================================================
 # 详见 docs/SillyTavern_Integration.md。
 
-AXIODRASIL_MODEL_ID = "axiodrasil-cabinet"
-CABINET_PERSONA_IDS = list(PERSONA_META.keys())
+AXIODRASIL_MODEL_ID = "axiodrasil-bina"
 
 
 class OpenAIChatMessage(BaseModel):
@@ -653,43 +545,13 @@ def _resolve_session_id(x_session_id: Optional[str], authorization: Optional[str
 
 @app.get("/v1/models")
 async def openai_compat_models():
-    """SillyTavern：返回内阁总模型 + 12 个人设模型（便于 Group 成员各自绑定）。"""
-    data = [
-        {
-            "id": AXIODRASIL_MODEL_ID,
-            "object": "model",
-            "created": 0,
-            "owned_by": "axiodrasil",
-        }
-    ]
-    for pid in CABINET_PERSONA_IDS:
-        data.append(
-            {
-                "id": f"axiodrasil-{pid}",
-                "object": "model",
-                "created": 0,
-                "owned_by": "axiodrasil",
-            }
-        )
-    return {"object": "list", "data": data}
-
-
-@app.post("/api/v1/cabinet/consensus")
-async def cabinet_consensus_api(x_session_id: str | None = Header(default=None)):
-    """显式散会：压缩 M1 吵架层 → M3 共识层。"""
-    if not x_session_id or not x_session_id.strip():
-        raise HTTPException(status_code=400, detail="missing x-session-id header")
-    session_id = x_session_id.strip()
-    try:
-        summary = close_and_compress(session_id)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"consensus failed: {exc}") from exc
-    return {
-        "session_id": session_id,
-        "ok": True,
-        "summary": summary or "",
-        "message": "已散会并写入共识" if summary else "无进行中的吵架缓冲，已关闭吵架状态",
-    }
+    """仅发布 Bina 模型。"""
+    return {"object": "list", "data": [{
+        "id": AXIODRASIL_MODEL_ID,
+        "object": "model",
+        "created": 0,
+        "owned_by": "axiodrasil",
+    }]}
 
 
 @app.post("/v1/chat/completions")
@@ -697,7 +559,7 @@ async def openai_compat_chat_completions(
     payload: OpenAIChatCompletionRequest,
     x_session_id: str | None = Header(default=None),
     authorization: str | None = Header(default=None),
-    x_persona: str | None = Header(default=None),
+    x_memory_thread: str | None = Header(default=None, alias="x-memory-thread"),
 ):
     session_id = _resolve_session_id(x_session_id, authorization, payload.user)
 
@@ -709,35 +571,16 @@ async def openai_compat_chat_completions(
     if not user_text:
         raise HTTPException(status_code=400, detail="no user message found in messages[]")
 
-    forced = _resolve_forced_persona(
-        x_persona=x_persona,
-        model=payload.model,
-        messages=payload.messages,
-    )
-    # Group Chat：有强制人设时去前缀并写 M1；无强制时保持旧单卡前缀行为
-    group_mode = forced is not None
-    chat_payload = ChatRequest(
-        text=user_text,
-        forced_persona=forced,
-        strip_persona_prefix=group_mode,
-        group_mode=group_mode,
-    )
+    chat_payload = ChatRequest(text=user_text, strip_persona_prefix=True)
     try:
-        reply, _intent, _trace_raw, _active, active_persona = _execute_turn(
-            chat_payload, session_id
+        reply, _intent, _trace_raw, _active, active_persona = await asyncio.to_thread(
+            _execute_turn, chat_payload, session_id,
+            memory_thread_id=resolve_memory_thread_id(x_memory_thread),
         )
     except HTTPException:
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"turn failed: {exc}") from exc
-
-    _after_turn_memory(
-        session_id,
-        user_text,
-        reply,
-        active_persona,
-        group_mode=group_mode,
-    )
 
     created_ts = int(datetime.now(timezone.utc).timestamp())
     completion_id = f"chatcmpl-{uuid4().hex[:24]}"

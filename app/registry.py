@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from app.matrix.ports import (
-    CabinetPort,
     ChatPort,
     HealthPort,
     PersonaPort,
@@ -21,7 +20,6 @@ class ModuleRegistry:
     session: Optional[SessionPort] = None
     chat: Optional[ChatPort] = None
     personas: Optional[PersonaPort] = None
-    cabinet: Optional[CabinetPort] = None
     trace: Optional[TracePort] = None
     extras: dict[str, Any] = field(default_factory=dict)
 
@@ -50,7 +48,6 @@ def set_registry(registry: ModuleRegistry) -> ModuleRegistry:
 
 def bootstrap_registry() -> ModuleRegistry:
     """装配默认适配器（包装现有 agents / memory / main 逻辑）。"""
-    from modules.cabinet_memory.adapter import CabinetAdapter
     from modules.chat_api.adapter import ChatAdapter, HealthAdapter, TraceAdapter
     from modules.personas.adapter import PersonaCatalog, SessionAdapter
 
@@ -59,7 +56,6 @@ def bootstrap_registry() -> ModuleRegistry:
         session=SessionAdapter(),
         chat=ChatAdapter(),
         personas=PersonaCatalog(),
-        cabinet=CabinetAdapter(),
         trace=TraceAdapter(),
     )
     return set_registry(reg)

@@ -6,7 +6,6 @@ import type {
   AttachmentIngestResult,
   ChatStreamMeta,
   ChatTurn,
-  ConsensusResult,
   HealthStatus,
   PersonaCard,
   SttResult,
@@ -28,14 +27,6 @@ async function readApiError(res: Response, fallback: string): Promise<string> {
     // plain text
   }
   return text;
-}
-
-function safeParseJson(line: string): unknown | null {
-  try {
-    return JSON.parse(line);
-  } catch {
-    return null;
-  }
 }
 
 export async function healthCheck(): Promise<HealthStatus> {
@@ -99,18 +90,6 @@ export async function fetchHistory(sessionId: string, limit = 50): Promise<ChatT
   });
 }
 
-export async function cabinetConsensus(sessionId: string): Promise<ConsensusResult> {
-  const res = await fetch("/api/cabinet/consensus", {
-    method: "POST",
-    headers: { "x-session-id": sessionId },
-  });
-  if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `consensus failed: ${res.status}`);
-  }
-  return (await res.json()) as ConsensusResult;
-}
-
 /** Solo 主路径：同步 JSON（经 Next rewrite → FastAPI），无伪 SSE 切块开销 */
 export async function sendChat(input: StreamChatInput): Promise<{
   reply: string;
@@ -121,10 +100,6 @@ export async function sendChat(input: StreamChatInput): Promise<{
     strip_persona_prefix: Boolean(input.stripPersonaPrefix),
   };
   if (input.forcedPersona) body.forced_persona = input.forcedPersona;
-  if (typeof input.groupMode === "boolean") body.group_mode = input.groupMode;
-  if (input.workflowMode && input.workflowMode !== "default") {
-    body.workflow_mode = input.workflowMode;
-  }
 
   const signal =
     input.signal ??
@@ -176,92 +151,6 @@ export async function sendChat(input: StreamChatInput): Promise<{
   return { reply, meta };
 }
 
-export async function streamChat(input: StreamChatInput): Promise<{
-  reply: string;
-  meta: ChatStreamMeta | null;
-}> {
-  const body: Record<string, unknown> = {
-    text: input.text,
-    strip_persona_prefix: Boolean(input.stripPersonaPrefix),
-  };
-  if (input.forcedPersona) body.forced_persona = input.forcedPersona;
-  if (typeof input.groupMode === "boolean") body.group_mode = input.groupMode;
-  if (input.workflowMode && input.workflowMode !== "default") {
-    body.workflow_mode = input.workflowMode;
-  }
-
-  // 默认 120s：伪流式整轮 LLM 可能较慢，但不能无限挂起
-  const signal =
-    input.signal ??
-    (typeof AbortSignal !== "undefined" && "timeout" in AbortSignal
-      ? AbortSignal.timeout(120_000)
-      : undefined);
-
-  const res = await fetch("/api/chat/stream", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-session-id": input.sessionId,
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!res.ok || !res.body) {
-    const text = await res.text().catch(() => "");
-    throw new Error(text || `stream failed: ${res.status}`);
-  }
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder("utf-8");
-  let buffer = "";
-  let reply = "";
-  let meta: ChatStreamMeta | null = null;
-  let sawDone = false;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const parts = buffer.split("\n\n");
-    buffer = parts.pop() || "";
-    for (const part of parts) {
-      const line = part
-        .split("\n")
-        .map((l) => l.trim())
-        .find((l) => l.startsWith("data:"));
-      if (!line) continue;
-      const payload = line.replace(/^data:\s*/, "");
-      const obj = safeParseJson(payload);
-      if (!obj || typeof obj !== "object") continue;
-      const rec = obj as Record<string, unknown>;
-      if (rec.type === "heartbeat") {
-        continue;
-      }
-      if (rec.type === "error") {
-        const detail = typeof rec.detail === "string" ? rec.detail : "stream error";
-        throw new Error(detail);
-      }
-      if (rec.type === "delta" && typeof rec.content === "string") {
-        reply += rec.content;
-        input.onDelta?.(rec.content);
-      } else if (rec.type === "done") {
-        sawDone = true;
-      } else if ("session_id" in rec) {
-        meta = rec as unknown as ChatStreamMeta;
-        input.onMeta?.(meta);
-      }
-    }
-  }
-
-  if (!reply && !sawDone) {
-    throw new Error("回复中断了，内线没有传回内容。可点「重新接通」或再发一次。");
-  }
-
-  return { reply, meta };
-}
-
-/** 文本/图片附件 → 服务端抽出或 VL 描述 */
 export async function ingestAttachment(
   file: File,
   sessionId?: string,

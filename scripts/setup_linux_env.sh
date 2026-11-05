@@ -8,31 +8,23 @@ cd "$ROOT"
 echo "[setup] project root: $ROOT"
 
 echo "[setup] apt packages..."
-# 无密码 sudo 时：在 Windows 侧执行  wsl -u root -- apt-get install -y redis-server ...
+# 无密码 sudo 时：在 Windows 侧执行  wsl -u root -- apt-get install -y ...
 if [ "$(id -u)" -eq 0 ]; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y python3 python3-pip python3-venv python3-dev \
-    build-essential redis-server curl ca-certificates
+    build-essential curl ca-certificates
 elif sudo -n true 2>/dev/null; then
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -y
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
     python3 python3-pip python3-venv python3-dev \
-    build-essential redis-server curl ca-certificates
+    build-essential curl ca-certificates
 else
-  echo "[setup] skip apt (need password). Ensure redis-server is installed, e.g.:"
-  echo "  wsl -u root -- apt-get install -y redis-server"
-  if ! command -v redis-server >/dev/null 2>&1; then
-    echo "[setup] ERROR: redis-server missing" >&2
-    exit 1
-  fi
+  echo "[setup] skip apt (need password). Install Python, build tools and Docker Compose."
 fi
 
-# 确保 redis 可本地起（不强制 systemd enable；dev 脚本会直接 redis-server）
-if command -v redis-server >/dev/null 2>&1; then
-  echo "[setup] redis-server: $(redis-server --version | head -1)"
-else
-  echo "[setup] ERROR: redis-server missing after apt install" >&2
+if ! docker compose version >/dev/null 2>&1; then
+  echo "[setup] Docker Compose is required for Hindsight" >&2
   exit 1
 fi
 

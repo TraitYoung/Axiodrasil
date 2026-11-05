@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Axiodrasil Linux / WSL 编排：redis + backend + frontend（不依赖 Windows CMD）
+# Axiodrasil Linux / WSL 编排：Hindsight + backend + frontend（不依赖 Windows CMD）
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -51,14 +51,13 @@ wait_port() {
 }
 
 load_pids() {
-  REDIS_PID=""; BACKEND_PID=""; FRONTEND_PID=""
+  BACKEND_PID=""; FRONTEND_PID=""
   # shellcheck disable=SC1090
   [ -f "$PID_FILE" ] && . "$PID_FILE" || true
 }
 
 save_pids() {
   cat >"$PID_FILE" <<EOF
-REDIS_PID=${REDIS_PID:-}
 BACKEND_PID=${BACKEND_PID:-}
 FRONTEND_PID=${FRONTEND_PID:-}
 EOF
@@ -81,24 +80,13 @@ stop_pid() {
   fi
 }
 
-start_redis() {
-  if port_listen 6379; then
-    echo "[redis] already listening on 6379"
+start_hindsight() {
+  if port_listen 8888; then
+    echo "[hindsight] already listening on 8888"
     return 0
   fi
-  if ! command -v redis-server >/dev/null 2>&1; then
-    echo "[redis] redis-server not installed (optional). Run: sudo apt-get install -y redis-server"
-    return 0
-  fi
-  nohup redis-server --port 6379 --daemonize no \
-    >"$LOG_DIR/redis.log" 2>&1 &
-  REDIS_PID=$!
-  sleep 0.4
-  if port_listen 6379; then
-    echo "[redis] started pid=$REDIS_PID"
-  else
-    echo "[redis] warn: not listening; see $LOG_DIR/redis.log"
-  fi
+  docker compose -f "$ROOT/docker-compose.yml" up -d hindsight
+  wait_port 8888 180
 }
 
 start_backend() {
@@ -160,7 +148,7 @@ stop_by_port() {
 
 cmd_start() {
   load_pids
-  start_redis
+  start_hindsight
   start_backend
   start_frontend
   save_pids
@@ -174,25 +162,21 @@ cmd_stop() {
   load_pids
   stop_pid frontend "${FRONTEND_PID:-}"
   stop_pid backend "${BACKEND_PID:-}"
-  stop_pid redis "${REDIS_PID:-}"
+  docker compose -f "$ROOT/docker-compose.yml" stop hindsight
   # 清理 next / uvicorn 残留
   pkill -f "next dev" 2>/dev/null || true
   pkill -f "next-server" 2>/dev/null || true
   pkill -f "uvicorn main:app" 2>/dev/null || true
   stop_by_port 3000 || true
   stop_by_port 8000 || true
-  # redis 若是 apt 服务，只杀我们拉起的；端口仍占则再清
-  if port_listen 6379; then
-    stop_by_port 6379 || true
-  fi
-  REDIS_PID=""; BACKEND_PID=""; FRONTEND_PID=""
+  BACKEND_PID=""; FRONTEND_PID=""
   save_pids
   echo "Stopped."
 }
 
 cmd_status() {
   load_pids
-  for name_port in redis:6379 backend:8000 frontend:3000; do
+  for name_port in hindsight:8888 backend:8000 frontend:3000; do
     name="${name_port%%:*}"
     port="${name_port##*:}"
     if port_listen "$port"; then

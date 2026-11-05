@@ -2,7 +2,7 @@ param(
     [ValidateSet("start", "stop", "restart", "status", "menu")]
     [string]$Action = "menu",
     [switch]$All,
-    [ValidateSet("redis", "backend", "frontend")]
+    [ValidateSet("hindsight", "backend", "frontend")]
     [string[]]$Service = @(),
     [switch]$ForceKillPort,
     [switch]$OpenBrowser
@@ -25,12 +25,12 @@ if ([string]::IsNullOrWhiteSpace($env:AX_DB_PATH)) {
 }
 
 $Services = @{
-    redis = @{
-        Name = "redis"
-        Port = 6379
+    hindsight = @{
+        Name = "hindsight"
+        Port = 8888
         Cwd = $ProjectRoot
-        Command = "redis-server --port 6379"
-        Log = Join-Path $LogDir "redis.log"
+        Command = "docker compose up -d hindsight"
+        Log = Join-Path $LogDir "hindsight.log"
     }
     backend = @{
         Name = "backend"
@@ -111,10 +111,10 @@ function Stop-ByPort([int]$Port) {
         }
         if ($stillAlive -and (Get-Process -Id $portPid -ErrorAction SilentlyContinue)) {
             Write-Warning @"
-仍无法结束 PID=${portPid}（常见原因：Redis 以 Windows 服务 / SYSTEM / 管理员身份启动，当前 PowerShell 权限不足）。
+仍无法结束 PID=${portPid}（进程可能属于其他用户或管理员）。
 请任选其一：
   1) 右键「以管理员身份运行」PowerShell，再执行： .\scripts\dev_stack.ps1 -Action stop -All
-  2) 若 Redis 是服务： services.msc 中找到 Redis 并「停止」
+  2) 检查系统服务与 Docker 容器
   3) 管理员 CMD： taskkill /F /PID ${portPid}
 "@
         }
@@ -123,7 +123,7 @@ function Stop-ByPort([int]$Port) {
 
 function Resolve-Targets {
     if ($All -or $Service.Count -eq 0) {
-        return @("redis", "backend", "frontend")
+        return @("hindsight", "backend", "frontend")
     }
     return $Service
 }
@@ -148,6 +148,11 @@ function Wait-PortListen([int]$Port, [int]$TimeoutSec = 90) {
 }
 
 function Start-One([string]$name, [hashtable]$pids) {
+    if ($name -eq "hindsight") {
+        Push-Location $ProjectRoot
+        try { docker compose up -d hindsight } finally { Pop-Location }
+        return
+    }
     $svc = $Services[$name]
     if ($null -eq $svc) { throw "Unknown service: $name" }
 
@@ -188,16 +193,15 @@ function Start-One([string]$name, [hashtable]$pids) {
     $proc = Start-Process -FilePath "powershell" -ArgumentList @("-NoProfile", "-Command", $psCmd) -PassThru -WindowStyle Minimized
     $pids[$name] = $proc.Id
     Write-Host "[$name] started (PID=$($proc.Id), port=$($svc.Port))"
-    if ($name -eq "redis") {
-        Start-Sleep -Milliseconds 500
-        $listen = @(Get-NetTCPConnection -LocalPort $svc.Port -State Listen -ErrorAction SilentlyContinue)
-        if ($listen.Count -eq 0) {
-            Write-Warning "[$name] 端口 $($svc.Port) 未处于 Listen。常见原因：旧实例（如 Windows 服务）仍占用端口，或 redis-server 启动失败。请查看 $($svc.Log)"
-        }
-    }
+
 }
 
 function Stop-One([string]$name, [hashtable]$pids) {
+    if ($name -eq "hindsight") {
+        Push-Location $ProjectRoot
+        try { docker compose stop hindsight } finally { Pop-Location }
+        return
+    }
     $svc = $Services[$name]
     if ($null -eq $svc) { throw "Unknown service: $name" }
 
@@ -299,8 +303,8 @@ function Show-Menu {
     Write-Host "2) Stop ALL"
     Write-Host "3) Restart ALL"
     Write-Host "4) Status"
-    Write-Host "5) Start one (redis/backend/frontend)"
-    Write-Host "6) Stop one (redis/backend/frontend)"
+    Write-Host "5) Start one (hindsight/backend/frontend)"
+    Write-Host "6) Stop one (hindsight/backend/frontend)"
     Write-Host "0) Exit"
     Write-Host ""
 }

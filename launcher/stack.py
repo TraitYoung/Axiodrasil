@@ -1,7 +1,7 @@
 """
 一键开聊编排：Windows 后端 +（必要时）WSL 前端。
 
-Redis 可选；日常路径不再依赖用户手敲 PowerShell。
+Hindsight 提供长期记忆；日常路径不再依赖用户手敲 PowerShell。
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ BACKEND_HEALTH_URL = "http://127.0.0.1:8000/api/v1/health"
 PROACTIVE_PENDING_URL = "http://127.0.0.1:8000/api/v1/proactive/pending"
 BACKEND_PORT = 8000
 FRONTEND_PORT = 3000
-REDIS_PORT = 6379
+HINDSIGHT_PORT = 8888
 
 _WSL_UNC_RE = re.compile(
     r"^\\\\(?:wsl\.localhost|wsl\$)\\([^\\]+)\\(.*)$",
@@ -35,17 +35,17 @@ _WSL_UNC_RE = re.compile(
 
 @dataclass(frozen=True)
 class ServiceStatus:
-    redis: bool
+    hindsight: bool
     backend: bool
     frontend: bool
 
     @property
     def all_up(self) -> bool:
-        return self.redis and self.backend and self.frontend
+        return self.hindsight and self.backend and self.frontend
 
     @property
     def ready_for_browser(self) -> bool:
-        return self.backend and self.frontend
+        return self.hindsight and self.backend and self.frontend
 
     @property
     def label(self) -> str:
@@ -159,7 +159,7 @@ def port_open(host: str, port: int, timeout: float = 0.4) -> bool:
 
 
 def http_ok(url: str, timeout: float = 10.0) -> bool:
-    """本机 health 偶发 4s+（Redis/SQLite）；默认超时放宽。"""
+    """本机 health 偶发 4s+（SQLite）；默认超时放宽。"""
     try:
         with urllib.request.urlopen(url, timeout=timeout) as resp:
             return 200 <= int(getattr(resp, "status", 200)) < 300
@@ -169,10 +169,10 @@ def http_ok(url: str, timeout: float = 10.0) -> bool:
 
 def probe_status() -> ServiceStatus:
     # 启动器以端口为准：health 过慢会导致误判“未就绪”并误杀进程
-    redis = port_open("127.0.0.1", REDIS_PORT)
+    hindsight = port_open("127.0.0.1", HINDSIGHT_PORT)
     backend = port_open("127.0.0.1", BACKEND_PORT)
     frontend = port_open("127.0.0.1", FRONTEND_PORT)
-    return ServiceStatus(redis=redis, backend=backend, frontend=frontend)
+    return ServiceStatus(hindsight=hindsight, backend=backend, frontend=frontend)
 
 
 def _norm_unc(path: Path) -> str:
@@ -390,30 +390,24 @@ def _ensure_frontend(root: Path, lines: list[str], pids: dict[str, int]) -> None
 
 
 def start_stack(root: Path) -> tuple[int, str]:
-    """启动后端 + 前端（Redis 尽力而为）。返回 (0|非0, 日志文本)。"""
+    """启动 Hindsight、后端和前端。返回 (0|非0, 日志文本)。"""
     lines: list[str] = []
     st = probe_status()
     if st.ready_for_browser:
-        lines.append("内阁已在运行，无需重复启动。")
+        lines.append("Bina已在运行，无需重复启动。")
         return 0, "\n".join(lines)
 
     log_dir = logs_dir(root)
     pids = _read_pids()
 
-    # Redis：可选；失败不影响开聊
-    if not st.redis:
-        try:
-            redis_cmd = (
-                f"redis-server --port {REDIS_PORT} *>> {_quote_ps(str(log_dir / 'redis.log'))} 2>&1"
-            )
-            pid = _start_hidden_powershell(redis_cmd)
-            pids["redis"] = pid
-            lines.append(f"已尝试启动 Redis（PID={pid}，可选）")
-            time.sleep(0.4)
-        except Exception as exc:
-            lines.append(f"跳过 Redis：{exc}")
-    else:
-        lines.append("Redis 已在运行（可选缓存）")
+    if not st.hindsight:
+        result = subprocess.run(
+            ["docker", "compose", "up", "-d", "hindsight"],
+            cwd=root, capture_output=True, text=True, timeout=300,
+        )
+        if result.returncode:
+            return result.returncode, result.stderr
+        lines.append("Hindsight 已启动")
 
     _ensure_backend(root, lines, pids)
     _ensure_frontend(root, lines, pids)
@@ -423,12 +417,12 @@ def start_stack(root: Path) -> tuple[int, str]:
     deadline = time.time() + 90
     while time.time() < deadline:
         if probe_status().ready_for_browser:
-            lines.append("内阁已就绪，可以开聊。")
+            lines.append("Bina已就绪，可以开聊。")
             return 0, "\n".join(lines)
         time.sleep(0.8)
 
     if probe_status().ready_for_browser:
-        lines.append("内阁已就绪，可以开聊。")
+        lines.append("Bina已就绪，可以开聊。")
         return 0, "\n".join(lines)
 
     lines.append("启动超时：后端或前端尚未就绪，可查看日志。")
@@ -441,7 +435,7 @@ def stop_stack(root: Path) -> tuple[int, str]:
     pids = _read_pids()
 
     # 先按记录 PID 杀 launcher 拉起的 powershell 外壳
-    for name in ("frontend", "backend", "redis"):
+    for name in ("frontend", "backend"):
         pid = int(pids.get(name) or 0)
         if pid > 0 and _process_alive(pid):
             try:
@@ -459,14 +453,14 @@ def stop_stack(root: Path) -> tuple[int, str]:
     for port, label in (
         (FRONTEND_PORT, "前端"),
         (BACKEND_PORT, "后端"),
-        # Redis 若是系统服务，普通用户可能杀不掉——尽力而为
-        (REDIS_PORT, "Redis"),
     ):
         notes = _stop_port(port)
         if notes:
             lines.extend(notes)
         else:
             lines.append(f"{label}端口 {port} 已空闲")
+
+    subprocess.run(["docker", "compose", "stop", "hindsight"], cwd=root, capture_output=True, timeout=90)
 
     # WSL 内 next 残留
     distro = wsl_distro(root)

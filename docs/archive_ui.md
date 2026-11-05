@@ -1,20 +1,7 @@
-# UI 软归档说明（Bina 单聊优先）
+# 历史实现清理
 
-当前产品入口收敛为 **Bina 单人聊天**（`/` → `/solo`）。
+当前页面入口为 Bina 单聊 `/solo`。旧群聊、演示台、角色选择抽屉及其专用接口已删除。消息列表组件归入 `frontend/src/modules/solo-chat/`。
 
-## 已软归档、仍保留代码
+其他人物设定与历史系统提示词保存在 `docs/characters/`。多人物路由、内阁记忆、开发流水线、日志清洗工具及其专用测试已删除。
 
-| 路径 | 说明 | 恢复方式 |
-|------|------|----------|
-| `frontend/app/group/` + `frontend/src/modules/group-chat/` | 内阁群聊 UI | 导航加回 `/group`；注意 `MessageList` 仍被 Solo 复用，**勿整目录删除** |
-| `frontend/app/lab/` | 旧演示台（清洗 / 工程流水线） | 直接访问 `/lab`；独占 `frontend/app/api/cleaning/files` |
-| 非 Bina 角色卡 JSON（`sillytavern/character_card/group/*.json`） | 仍保留；公开 `GET /api/v1/personas` 只列 Bina | `PersonaCatalog.list_cards` 去掉公开过滤即可 |
-
-## 后端未删
-
-- `agents/persona_meta.py` 全量路由表与人格 ID
-- `agents/router.py` 各人格节点
-- `prompts/system_prompts.py` 各人格 prompt
-- `/v1/models` / SillyTavern 强制人格协议
-
-历史会话、M2 私忆与 `axiodrasil-<id>` 模型 ID 仍依赖这些注册项。Bina 单聊稳定后，可按 Solo 壳复制其他人设。
+长期记忆统一使用 Hindsight。本地 `storage/chat_history.py` 仅保存原始聊天记录，沿用已有 `chat_turns` 表。旧 L3、FTS5、向量检索、Redis 缓存与滚动摘要实现已删除。

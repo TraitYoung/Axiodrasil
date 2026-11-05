@@ -76,8 +76,8 @@ function Restart-PortServiceWithConfirm {
 }
 
 # 便捷包装函数（本项目常用）
-function Restart-RedisDev {
-    Restart-PortServiceWithConfirm -Port 6379 -StartCommand 'redis-server --port 6379'
+function Restart-HindsightDev {
+    docker compose up -d --force-recreate hindsight
 }
 
 function Restart-BackendDev {
