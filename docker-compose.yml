@@ -1,10 +1,32 @@
 services:
-  redis:
-    image: redis:7-alpine
-    container_name: axiodrasil-redis
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:1.2.0
     ports:
-      - "6379:6379"
-    command: ["redis-server", "--appendonly", "yes"]
+      - "127.0.0.1:8888:8888"
+      - "127.0.0.1:9999:9999"
+    shm_size: 1gb
+    stop_grace_period: 75s
+    environment:
+      HINDSIGHT_API_LLM_PROVIDER: ${HINDSIGHT_API_LLM_PROVIDER:-deepseek}
+      HINDSIGHT_API_LLM_API_KEY: ${HINDSIGHT_API_LLM_API_KEY:-${DEEPSEEK_API_KEY:-}}
+      HINDSIGHT_API_LLM_MODEL: ${HINDSIGHT_API_LLM_MODEL:-deepseek-chat}
+      HINDSIGHT_API_LLM_BASE_URL: ${HINDSIGHT_API_LLM_BASE_URL:-https://api.deepseek.com}
+      HINDSIGHT_API_LLM_OUTPUT_LANGUAGE: Chinese
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      HINDSIGHT_API_EMBEDDINGS_LOCAL_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      HINDSIGHT_API_RERANKER_PROVIDER: local
+      HINDSIGHT_API_RERANKER_LOCAL_MODEL: cross-encoder/mmarco-mMiniLMv2-L12-H384-v1
+      HINDSIGHT_API_WORKER_ID: axiodrasil-hindsight
+      HF_HOME: /home/hindsight/.cache/huggingface
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+      - hindsight-models:/home/hindsight/.cache/huggingface
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8888/health', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      start_period: 240s
+      retries: 6
 
   api:
     image: python:3.13-slim
@@ -15,11 +37,16 @@ services:
     env_file:
       - .env
     environment:
-      REDIS_URL: redis://redis:6379/0
+      AX_HINDSIGHT_URL: http://hindsight:8888
     command: >
       sh -c "pip install --no-cache-dir -r requirements.txt &&
              uvicorn main:app --host 0.0.0.0 --port 8000 --reload"
     ports:
       - "8000:8000"
     depends_on:
-      - redis
+      hindsight:
+        condition: service_healthy
+
+volumes:
+  hindsight-data:
+  hindsight-models:

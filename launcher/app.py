@@ -98,7 +98,7 @@ class LauncherApp(ctk.CTk):
         state_box = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=14)
         state_box.pack(fill="x", padx=20, pady=(10, 6))
 
-        self.state_var = tk.StringVar(value="内阁状态：…")
+        self.state_var = tk.StringVar(value="Bina状态：…")
         self.state_label = ctk.CTkLabel(
             state_box,
             textvariable=self.state_var,
@@ -213,12 +213,12 @@ class LauncherApp(ctk.CTk):
 
     def _apply_status(self, st: stack.ServiceStatus) -> None:
         label = st.label
-        self.state_var.set(f"内阁状态：{label}")
+        self.state_var.set(f"Bina状态：{label}")
         if st.backend:
             color = OK if st.frontend else WARN
-            redis_hint = "记忆加速已开" if st.redis else "记忆加速未开（可忽略）"
+            memory_hint = "Hindsight 已连接" if st.hindsight else "Hindsight 未连接"
             fe = "界面已开" if st.frontend else "界面按需打开"
-            self.detail_var.set(f"引擎在跑 · {fe} · {redis_hint}")
+            self.detail_var.set(f"引擎在跑 · {fe} · {memory_hint}")
         elif st.frontend:
             color = WARN
             self.detail_var.set("界面在，引擎未就绪")

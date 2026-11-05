@@ -13,7 +13,6 @@ from typing import Any, AsyncIterator, Optional, Protocol
 @dataclass(frozen=True)
 class HealthStatus:
     ok: bool
-    redis: bool = False
     llm_provider: str = ""
     chat_model: str = ""
 
@@ -62,8 +61,6 @@ class HealthPort(Protocol):
 
 
 class SessionPort(Protocol):
-    def group_session_id(self) -> str: ...
-
     def solo_session_id(self, persona_id: str, user_local_id: str) -> str: ...
 
     def resolve(self, raw: Optional[str], *, fallback: str = "") -> str: ...
@@ -91,12 +88,6 @@ class PersonaPort(Protocol):
     def list_cards(self) -> list[PersonaCard]: ...
 
     def get_card(self, persona_id: str) -> Optional[PersonaCard]: ...
-
-
-class CabinetPort(Protocol):
-    def consensus(self, session_id: str) -> dict[str, Any]: ...
-
-    def default_member_ids(self) -> list[str]: ...
 
 
 class TracePort(Protocol):

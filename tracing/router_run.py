@@ -35,42 +35,11 @@ def _summarize_update(update: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-def run_router_light(graph, graph_state: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Solo 轻路径：graph.invoke，不收集逐步 updates（更快、trace 仅占位）。"""
-    t0 = time.perf_counter()
-    result = graph.invoke(graph_state)
-    duration_ms = round((time.perf_counter() - t0) * 1000, 2)
-    steps = [
-        {
-            "index": 1,
-            "node": "solo_fast" if graph_state.get("solo_fast") else "invoke",
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "duration_ms": duration_ms,
-            "keys_written": list(result.keys()) if isinstance(result, dict) else [],
-            "summary": _summarize_update(result) if isinstance(result, dict) else {},
-        }
-    ]
-    return result if isinstance(result, dict) else {}, steps
-
-
 def run_router_traced(graph, graph_state: Dict[str, Any]) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """
     执行编译后的 LangGraph，返回与 invoke 等价的累积 state 与追踪步骤列表。
-    在 parser 之后会追加一步 __router__（与 route_by_intent 一致），便于对齐条件边。
+    每个节点只记录状态键与简短预览。
     """
-    from agents.persona_meta import ROUTE_TO_NODE
-    from agents.route_resolver import route_by_intent
-
-    # Solo 快速通道默认走轻路径（可用 AX_TRACE_SOLO=1 强制逐步 trace）
-    import os
-
-    if graph_state.get("solo_fast") and os.getenv("AX_TRACE_SOLO", "0").strip() not in (
-        "1",
-        "true",
-        "True",
-    ):
-        return run_router_light(graph, graph_state)
-
     accumulated: Dict[str, Any] = {**graph_state}
     steps: List[Dict[str, Any]] = []
     t_prev = time.perf_counter()
@@ -111,25 +80,6 @@ def run_router_traced(graph, graph_state: Dict[str, Any]) -> Tuple[Dict[str, Any
                     "summary": summary,
                 }
             )
-
-            if node_str == "parser" and accumulated.get("intent") is not None:
-                try:
-                    rk = route_by_intent(accumulated)  # type: ignore[arg-type]
-                except Exception as exc:
-                    rk = f"<route_error:{exc}>"
-                steps.append(
-                    {
-                        "index": 0,
-                        "node": "__router__",
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "duration_ms": 0.0,
-                        "keys_written": [],
-                        "summary": {
-                            "route_key": rk,
-                            "next_node": ROUTE_TO_NODE.get(str(rk), str(rk)),
-                        },
-                    }
-                )
 
     for i, s in enumerate(steps, start=1):
         s["index"] = i

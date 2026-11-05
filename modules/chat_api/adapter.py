@@ -12,9 +12,7 @@ from uuid import uuid4
 from app.matrix.ports import ChatStreamResult, ChatTurn, HealthStatus, TraceStepView
 from modules.chat_api.service import (
     TurnRequest,
-    get_shared_session_cache,
     get_turn_service,
-    resolve_group_mode,
 )
 
 
@@ -22,10 +20,8 @@ class HealthAdapter:
     def check(self) -> HealthStatus:
         from infra import get_chat_model, get_llm_provider
 
-        cache = get_shared_session_cache()
         return HealthStatus(
             ok=True,
-            redis=cache.ping(),
             llm_provider=get_llm_provider(),
             chat_model=get_chat_model(),
         )
@@ -74,7 +70,6 @@ class ChatAdapter:
             text,
             result.reply,
             result.active_persona,
-            group_mode=resolve_group_mode(payload),
         )
         return ChatStreamResult(
             session_id=session_id,

@@ -13,7 +13,7 @@ import {
 } from "@/matrix/client";
 import type { ChatTurn, PersonaCard } from "@/matrix/types";
 import { PersonaAvatar } from "@/modules/persona-cards/PersonaAvatar";
-import { MessageList, type BubbleMessage } from "@/modules/group-chat/MessageList";
+import { MessageList, type BubbleMessage } from "@/modules/solo-chat/MessageList";
 import { CuteWait, THINK_LINES, useRotatingLine } from "@/modules/solo-chat/CuteWait";
 import { ConversationMenu } from "@/modules/solo-chat/ConversationMenu";
 import {
@@ -372,7 +372,6 @@ export function SoloChatView() {
         memoryThreadId,
         forcedPersona: BINA_ID,
         stripPersonaPrefix: true,
-        groupMode: false,
         signal: controller.signal,
       });
       setMessages((prev) =>

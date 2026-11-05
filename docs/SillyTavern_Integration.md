@@ -1,3 +1,5 @@
+> 历史集成说明。旧群聊、内阁角色卡和头像切换扩展已删除。当前仅提供 Bina 的 OpenAI 兼容接口，运行方式以根目录 README.md 为准。
+
 # SillyTavern Group Chat 接入 Axiodrasil
 
 后端提供 OpenAI 兼容接口：`http://127.0.0.1:8000/v1`。  

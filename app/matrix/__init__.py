@@ -1,7 +1,6 @@
 """统一接口矩阵（Ports）——主体与功能模块之间的唯一契约面。"""
 
 from app.matrix.ports import (
-    CabinetPort,
     ChatPort,
     ChatStreamResult,
     ChatTurn,
@@ -23,7 +22,6 @@ __all__ = [
     "ChatStreamResult",
     "PersonaPort",
     "PersonaCard",
-    "CabinetPort",
     "TracePort",
     "TraceStepView",
 ]

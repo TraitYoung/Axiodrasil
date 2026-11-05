@@ -52,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     if action == "status":
         st = probe_status()
         print(
-            f"redis={st.redis} backend={st.backend} frontend={st.frontend} "
+            f"hindsight={st.hindsight} backend={st.backend} frontend={st.frontend} "
             f"ready={st.ready_for_browser}"
         )
         return 0 if st.ready_for_browser else 1

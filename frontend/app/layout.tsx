@@ -21,7 +21,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Axiodrasil · Bina",
-  description: "Axiodrasil Bina 单人谈话",
+  description: "Bina 虚拟具身、互动与记忆实验",
 };
 
 export default function RootLayout({
